@@ -23,6 +23,8 @@ A utility with a convenient interface for dumping BIOS to a PC and performing ba
 
 ## How It Works
 
+<img width="1097" height="747" alt="Screenshot_4" src="https://github.com/user-attachments/assets/a10edbe7-9dd4-4610-a49b-98237b106c74" />
+
 - The main UI and logic are in `combined_source.py`.
 - BIOS access uses SCEWIN utilities and drivers: `SCEWIN_64.exe`, `amifldrv64.sys`, `amigendrv64.sys`.
 - If you do not trust the .exe files and drivers in the original archive, download it from the official Msi Center website, copy the files to the program folder, or use this script https://github.com/ab3lkaizen/SCEHUB to export .exe files and .sys drivers.
