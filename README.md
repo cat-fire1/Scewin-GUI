@@ -25,6 +25,7 @@ A utility with a convenient interface for dumping BIOS to a PC and performing ba
 
 - The main UI and logic are in `combined_source.py`.
 - BIOS access uses SCEWIN utilities and drivers: `SCEWIN_64.exe`, `amifldrv64.sys`, `amigendrv64.sys`.
+- If you do not trust the .exe files and drivers in the original archive, download it from the official Msi Center website, copy the files to the program folder, or use this script https://github.com/ab3lkaizen/SCEHUB to export .exe files and .sys drivers.
 - The dump is saved as a text file (e.g., `nvram.txt`); edits can be saved to a new file (e.g., `nvram_new.txt`).
 - Keep backups in the `backups/` folder.
 
