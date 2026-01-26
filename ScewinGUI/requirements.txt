@@ -1,0 +1,4 @@
+PyQt6
+PyQt6-Fluent-Widgets
+# Optional: enables single-instance mutex handling on Windows.
+pywin32
