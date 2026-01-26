@@ -1,42 +1,39 @@
-# Scewin-GUI
-Scewin GUI make for simple use
-
 # Scewin GUI
 
-Утилита с удобным интерфейсом для выгрузки BIOS на ПК и его базового редактирования.
+A utility with a convenient interface for dumping BIOS to a PC and performing basic edits.
 
-## Возможности
+## Features
 
-- Выгрузка (дамп) BIOS в файл на ПК.
-- Редактирование доступных параметров через графический интерфейс.
-- Сохранение изменений в файл для последующей прошивки/применения.
+- Dump BIOS to a file on the PC.
+- Edit available parameters through a graphical interface.
+- Save changes to a file for later flashing/applying.
 
-## Требования
+## Requirements
 
 - Windows x64.
-- Права администратора (для доступа к системным настройкам).
-- Драйверы/утилиты из комплекта SCEWIN (прилагаются в репозитории).
+- Administrator privileges (for access to system settings).
+- SCEWIN drivers/utilities (included in the repository).
 
-## Быстрый старт
+## Quick Start
 
-1. Запустите приложение от имени администратора.
-2. Нажмите "Выгрузить BIOS" и выберите путь для сохранения файла.
-3. Откройте файл в интерфейсе программы и внесите изменения.
-4. Сохраните результат в новый файл.
+1. Run the application as administrator.
+2. Click "Dump BIOS" and choose a save path.
+3. Open the file in the interface and make changes.
+4. Save the result to a new file.
 
-## Как работает программа
+## How It Works
 
-- Основной интерфейс и логика находятся в `combined_source.py`.
-- Для доступа к BIOS используются утилиты и драйверы SCEWIN: `SCEWIN_64.exe`, `amifldrv64.sys`, `amigendrv64.sys`.
-- Выгрузка сохраняется в текстовый файл (например, `nvram.txt`), изменения можно сохранить в новый файл (например, `nvram_new.txt`).
-- Резервные копии рекомендуется хранить в папке `backups/`.
+- The main UI and logic are in `combined_source.py`.
+- BIOS access uses SCEWIN utilities and drivers: `SCEWIN_64.exe`, `amifldrv64.sys`, `amigendrv64.sys`.
+- The dump is saved as a text file (e.g., `nvram.txt`); edits can be saved to a new file (e.g., `nvram_new.txt`).
+- Keep backups in the `backups/` folder.
 
-## Важно
+## Important
 
-- Любые изменения BIOS вы выполняете на свой риск.
-- Перед редактированием обязательно сделайте резервную копию.
-- Неверные параметры могут привести к неработоспособности устройства.
+- You modify BIOS at your own risk.
+- Always make a backup before editing.
+- Incorrect parameters can make the device unusable.
 
-## Лицензия
+## License
 
-Apache-2.0. Все права защищены разработчиком cat_fire.
+Apache-2.0. All rights reserved by the developer cat_fire.
