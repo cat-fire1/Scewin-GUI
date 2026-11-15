@@ -24,7 +24,9 @@
 - Build Windows app: `.\build.ps1`; use a fresh `-DistPath` when old output contains local data.
 - Package a clean ZIP: `.\package-release.ps1 -BundlePath <bundle-directory>`.
 
-Windows builds require PyInstaller. The packaged app requires WebView2 Runtime.
+Windows builds use PyInstaller --onefile: Python dependencies and UI assets are
+embedded in ScewinGUI.exe. Only the SCEWIN executable and two drivers are external.
+The packaged app requires WebView2 Runtime. Never package an _internal directory.
 
 ## Coding Style & Naming Conventions
 

@@ -6,13 +6,20 @@ A Windows desktop utility for reading, editing and applying SCEWIN NVRAM setting
 
 **[Download the latest Windows x64 ZIP](https://github.com/cat-fire1/Scewin-GUI/releases/latest/download/ScewinGUI-windows-x64.zip)**
 
-[Version 4.0.0 release notes and SHA-256 checksum](https://github.com/cat-fire1/Scewin-GUI/releases/tag/v4.0.0)
+[Version 4.0.1 release notes and SHA-256 checksum](https://github.com/cat-fire1/Scewin-GUI/releases/tag/v4.0.1)
 
 1. Extract the **entire** archive to a writable folder.
-2. Keep `_internal`, `SCEWIN_64.exe` and both `.sys` files beside `ScewinGUI.exe`.
+2. Keep `SCEWIN_64.exe`, `amifldrv64.sys` and `amigendrv64.sys` beside `ScewinGUI.exe`.
 3. Start `ScewinGUI.exe`. Run as administrator when performing BIOS operations.
 
-The packaged application does not require Python or Node.js. Windows x64 and Microsoft Edge WebView2 Runtime are required.
+Python, application libraries, translations and the React interface are embedded in one `ScewinGUI.exe`. There is no `_internal` folder. The packaged application does not require Python or Node.js. Windows x64 and Microsoft Edge WebView2 Runtime are required.
+
+## What's new in 4.0.1
+
+- Single-file Python application built with PyInstaller `--onefile`.
+- Only three vendor files remain external to `ScewinGUI.exe`.
+- The release archive contains the application, vendor files, license and instructions.
+- Verified startup from an unrelated working directory, embedded resources, synthetic NVRAM loading and automatic temporary runtime cleanup.
 
 ## What's new in 4.0.0
 
@@ -54,6 +61,7 @@ python tests/smoke_desktop.py
 python -m pip install pyinstaller
 .\build.ps1
 .\package-release.ps1
+python tests/smoke_onefile.py releases/v4.0.1/ScewinGUI-windows-x64.zip
 ```
 
 Run these commands from `ScewinGUI/`. The smoke test uses synthetic files with 2,400 parameters and blocks all SCEWIN process execution. Release ZIPs exclude user dumps, backups, settings, logs, caches and development dependencies.

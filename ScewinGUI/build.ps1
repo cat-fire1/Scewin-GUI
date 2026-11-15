@@ -18,6 +18,9 @@ try {
             throw "Build output contains local data ($runtimeName). Use a different -DistPath to preserve it."
         }
     }
+    if (Test-Path -LiteralPath (Join-Path $bundlePath '_internal')) {
+        throw 'Build output contains an older directory-based bundle. Use a fresh -DistPath.'
+    }
     if (-not $SkipInstall) {
         & npm ci --prefix frontend
         if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
@@ -25,8 +28,8 @@ try {
     & npm run build --prefix frontend
     if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed' }
 
-    & python -m PyInstaller --noconfirm --windowed --onedir `
-        --name ScewinGUI --icon icon.ico --distpath $outputRoot `
+    & python -m PyInstaller --noconfirm --windowed --onefile `
+        --name ScewinGUI --icon icon.ico --distpath $bundlePath `
         --add-data 'frontend/dist;frontend/dist' `
         --add-data 'scewin_gui/translations;translations' `
         --add-data 'icon.ico;.' `

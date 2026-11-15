@@ -1,8 +1,8 @@
 # Scewin GUI
 
-**Версия 4.0.0:** [скачать ZIP для Windows x64](https://github.com/cat-fire1/Scewin-GUI/releases/latest/download/ScewinGUI-windows-x64.zip) · [описание релиза](https://github.com/cat-fire1/Scewin-GUI/releases/tag/v4.0.0).
+**Версия 4.0.1:** [скачать ZIP для Windows x64](https://github.com/cat-fire1/Scewin-GUI/releases/latest/download/ScewinGUI-windows-x64.zip) · [описание релиза](https://github.com/cat-fire1/Scewin-GUI/releases/tag/v4.0.1).
 
-Распакуйте архив целиком и запустите `ScewinGUI/ScewinGUI.exe`. Папку `_internal` и vendor-файлы оставьте рядом с EXE. Устанавливать Python и Node.js для готовой сборки не нужно; необходим WebView2 Runtime.
+Распакуйте архив и запустите `ScewinGUI/ScewinGUI.exe`. Python, библиотеки и интерфейс упакованы в один EXE. Рядом нужны только `SCEWIN_64.exe`, `amifldrv64.sys` и `amigendrv64.sys`; папка `_internal` не используется. Устанавливать Python и Node.js для готовой сборки не нужно; необходим WebView2 Runtime.
 
 Десктопный редактор NVRAM для Windows. Интерфейс перенесён на **React + TypeScript + CSS**, окно приложения работает через **pywebview / WebView2**. Парсер, валидация, атомарное сохранение и операции SCEWIN остаются на Python.
 
@@ -104,7 +104,7 @@ python -m pip install pyinstaller
 .\build.ps1
 ```
 
-Результат: `dist/ScewinGUI/ScewinGUI.exe`. Распространяйте всю папку `dist/ScewinGUI`, включая `_internal` и vendor-файлы. Node.js и установленный Python пользователю сборки не нужны; WebView2 Runtime должен присутствовать в Windows. Локальные настройки, дампы, логи и бэкапы не включаются в сборку. Для повторной сборки без `npm ci`: `.\build.ps1 -SkipInstall`.
+Результат: `dist/ScewinGUI/ScewinGUI.exe`. PyInstaller работает в режиме `--onefile`: Python, библиотеки, переводы, иконка и React-интерфейс находятся внутри EXE. Рядом остаются три vendor-файла. При запуске встроенные компоненты автоматически распаковываются во временную папку, а настройки, дампы, логи и бэкапы сохраняются рядом с EXE. Node.js и установленный Python пользователю сборки не нужны; WebView2 Runtime должен присутствовать в Windows. Для повторной сборки без `npm ci`: `.\build.ps1 -SkipInstall`.
 
 Если в папке предыдущей сборки уже есть дампы, настройки или бэкапы, скрипт не перезапишет её. Выберите отдельный каталог:
 
@@ -113,4 +113,12 @@ python -m pip install pyinstaller
 .\package-release.ps1 -BundlePath artifacts/release-build/ScewinGUI
 ```
 
-Архив и контрольная сумма появятся в `releases/v4.0.0/`. В ZIP входят только EXE, vendor-файлы, `_internal`, лицензия и инструкция; пользовательские дампы и бэкапы не добавляются.
+Архив и контрольная сумма появятся в `releases/v4.0.1/`. В ZIP входят только EXE, три vendor-файла, лицензия и инструкция; пользовательские дампы и бэкапы не добавляются.
+
+Проверка именно упакованной однофайловой версии:
+
+```powershell
+python tests/smoke_onefile.py releases/v4.0.1/ScewinGUI-windows-x64.zip
+```
+
+Сценарий распаковывает архив во временную папку, запускает EXE из другого рабочего каталога и проверяет встроенные компоненты, загрузку синтетического NVRAM, внешние vendor-файлы, закрытие и удаление временного Python runtime. Операции SCEWIN не запускаются.

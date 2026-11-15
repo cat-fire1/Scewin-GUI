@@ -10,7 +10,7 @@ import type { DesktopState, Page, RunAction, Update } from './types';
 
 const initial: DesktopState = {
   document_id: '', filepath: '', dirty: false, modified_count: 0, logs: [],
-  language: 'ru', settings: [], backups: [], app_name: 'Scewin GUI', version: '4.0.0',
+  language: 'ru', settings: [], backups: [], app_name: 'Scewin GUI', version: '4.0.1',
 };
 
 export function App() {

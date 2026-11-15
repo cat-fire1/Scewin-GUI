@@ -28,8 +28,9 @@ foreach ($name in $requiredFiles) {
         throw "Missing bundle file: $name"
     }
 }
-$internal = Join-Path $bundle '_internal'
-if (-not (Test-Path -LiteralPath $internal -PathType Container)) { throw 'Missing _internal runtime directory.' }
+if (Test-Path -LiteralPath (Join-Path $bundle '_internal')) {
+    throw 'Expected a single-file application. Rebuild with --onefile in a fresh output directory.'
+}
 $releaseDirectory = Join-Path $output "v$Version"
 New-Item -ItemType Directory -Path $releaseDirectory -Force | Out-Null
 $zipPath = Join-Path $releaseDirectory 'ScewinGUI-windows-x64.zip'
@@ -44,14 +45,6 @@ try {
             [System.IO.Compression.CompressionLevel]::Optimal
         ) | Out-Null
     }
-    foreach ($file in Get-ChildItem -LiteralPath $internal -File -Recurse) {
-        $relative = $file.FullName.Substring($bundle.Length + 1).Replace('\', '/')
-        if ($relative -match '(^|/)(__pycache__|node_modules|\.vite)(/|$)') { continue }
-        [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-            $archive, $file.FullName, "ScewinGUI/$relative",
-            [System.IO.Compression.CompressionLevel]::Optimal
-        ) | Out-Null
-    }
     [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
         $archive, (Join-Path $PSScriptRoot 'LICENSE'), 'ScewinGUI/LICENSE',
         [System.IO.Compression.CompressionLevel]::Optimal
@@ -61,7 +54,8 @@ try {
     try {
         $writer.WriteLine("Scewin GUI $Version - Windows x64")
         $writer.WriteLine('Extract the entire ScewinGUI folder before starting ScewinGUI.exe.')
-        $writer.WriteLine('Keep the _internal folder and bundled SCEWIN files beside the application.')
+        $writer.WriteLine('Python, application libraries and the interface are embedded in ScewinGUI.exe.')
+        $writer.WriteLine('Keep SCEWIN_64.exe, amifldrv64.sys and amigendrv64.sys beside the application.')
         $writer.WriteLine('Microsoft Edge WebView2 Runtime is required. Python and Node.js are not required.')
         $writer.WriteLine('Administrator privileges are required for BIOS operations.')
         $writer.WriteLine('Always keep backups before changing BIOS settings.')
