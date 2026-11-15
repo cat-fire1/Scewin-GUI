@@ -1,6 +1,6 @@
 # Scewin GUI
 
-**Версия 4.0.1:** [скачать ZIP для Windows x64](https://github.com/cat-fire1/Scewin-GUI/releases/latest/download/ScewinGUI-windows-x64.zip) · [описание релиза](https://github.com/cat-fire1/Scewin-GUI/releases/tag/v4.0.1).
+**Версия 2.0.0:** [скачать ZIP для Windows x64](https://github.com/cat-fire1/Scewin-GUI/releases/latest/download/ScewinGUI-windows-x64.zip) · [описание релиза](https://github.com/cat-fire1/Scewin-GUI/releases/tag/v2.0.0).
 
 Распакуйте архив и запустите `ScewinGUI/ScewinGUI.exe`. Python, библиотеки и интерфейс упакованы в один EXE. Рядом нужны только `SCEWIN_64.exe`, `amifldrv64.sys` и `amigendrv64.sys`; папка `_internal` не используется. Устанавливать Python и Node.js для готовой сборки не нужно; необходим WebView2 Runtime.
 
@@ -21,7 +21,7 @@ npm run build --prefix frontend
 python main.py
 ```
 
-После сборки интерфейса обычный запуск требует только `python main.py`: Node.js и сервер разработки при этом не используются. Старый `main.exe` в корне относится к предыдущей Qt-версии.
+После сборки интерфейса обычный запуск требует только `python main.py`: Node.js и сервер разработки при этом не используются. Готовую сборку запускайте через `dist/ScewinGUI/ScewinGUI.exe`.
 
 ## Разработка с автоматическим обновлением
 
@@ -113,12 +113,12 @@ python -m pip install pyinstaller
 .\package-release.ps1 -BundlePath artifacts/release-build/ScewinGUI
 ```
 
-Архив и контрольная сумма появятся в `releases/v4.0.1/`. В ZIP входят только EXE, три vendor-файла, лицензия и инструкция; пользовательские дампы и бэкапы не добавляются.
+Архив и контрольная сумма появятся в `releases/v2.0.0/`. В ZIP входят только EXE, три vendor-файла, лицензия и инструкция; пользовательские дампы и бэкапы не добавляются.
 
 Проверка именно упакованной однофайловой версии:
 
 ```powershell
-python tests/smoke_onefile.py releases/v4.0.1/ScewinGUI-windows-x64.zip
+python tests/smoke_onefile.py releases/v2.0.0/ScewinGUI-windows-x64.zip
 ```
 
 Сценарий распаковывает архив во временную папку, запускает EXE из другого рабочего каталога и проверяет встроенные компоненты, загрузку синтетического NVRAM, внешние vendor-файлы, закрытие и удаление временного Python runtime. Операции SCEWIN не запускаются.

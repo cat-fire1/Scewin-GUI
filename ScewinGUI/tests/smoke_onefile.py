@@ -1,6 +1,6 @@
 """Verify the published onefile ZIP with synthetic data and an unrelated CWD.
 
-Usage: python tests/smoke_onefile.py releases/v4.0.1/ScewinGUI-windows-x64.zip
+Usage: python tests/smoke_onefile.py releases/v2.0.0/ScewinGUI-windows-x64.zip
 No SCEWIN command is executed; the app only auto-loads the synthetic NVRAM file.
 """
 

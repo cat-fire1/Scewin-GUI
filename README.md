@@ -6,7 +6,7 @@ A Windows desktop utility for reading, editing and applying SCEWIN NVRAM setting
 
 **[Download the latest Windows x64 ZIP](https://github.com/cat-fire1/Scewin-GUI/releases/latest/download/ScewinGUI-windows-x64.zip)**
 
-[Version 4.0.1 release notes and SHA-256 checksum](https://github.com/cat-fire1/Scewin-GUI/releases/tag/v4.0.1)
+[Version 2.0.0 release notes and SHA-256 checksum](https://github.com/cat-fire1/Scewin-GUI/releases/tag/v2.0.0)
 
 1. Extract the **entire** archive to a writable folder.
 2. Keep `SCEWIN_64.exe`, `amifldrv64.sys` and `amigendrv64.sys` beside `ScewinGUI.exe`.
@@ -14,14 +14,12 @@ A Windows desktop utility for reading, editing and applying SCEWIN NVRAM setting
 
 Python, application libraries, translations and the React interface are embedded in one `ScewinGUI.exe`. There is no `_internal` folder. The packaged application does not require Python or Node.js. Windows x64 and Microsoft Edge WebView2 Runtime are required.
 
-## What's new in 4.0.1
+## Version 2.0.0
 
 - Single-file Python application built with PyInstaller `--onefile`.
 - Only three vendor files remain external to `ScewinGUI.exe`.
 - The release archive contains the application, vendor files, license and instructions.
 - Verified startup from an unrelated working directory, embedded resources, synthetic NVRAM loading and automatic temporary runtime cleanup.
-
-## What's new in 4.0.0
 
 - React + TypeScript interface in a pywebview / WebView2 desktop window.
 - The familiar dark Fluent styling, editor, backup manager and documentation.
@@ -34,7 +32,7 @@ Python, application libraries, translations and the React interface are embedded
 
 ## Source and development
 
-The application source is in [`ScewinGUI/`](ScewinGUI/). The previous Git history and the older `bios` release remain available.
+The application source is in [`ScewinGUI/`](ScewinGUI/). The current downloadable build is 2.0.0.
 
 ```powershell
 cd ScewinGUI
@@ -61,7 +59,7 @@ python tests/smoke_desktop.py
 python -m pip install pyinstaller
 .\build.ps1
 .\package-release.ps1
-python tests/smoke_onefile.py releases/v4.0.1/ScewinGUI-windows-x64.zip
+python tests/smoke_onefile.py releases/v2.0.0/ScewinGUI-windows-x64.zip
 ```
 
 Run these commands from `ScewinGUI/`. The smoke test uses synthetic files with 2,400 parameters and blocks all SCEWIN process execution. Release ZIPs exclude user dumps, backups, settings, logs, caches and development dependencies.
