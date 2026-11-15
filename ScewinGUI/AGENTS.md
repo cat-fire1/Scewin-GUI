@@ -7,7 +7,6 @@
 - `scewin_gui/desktop.py` hosts the interface with pywebview / WebView2.
 - `scewin_gui/desktop_api.py` connects the interface to the Python services.
 - `scewin_gui/core.py` contains BIOS parsing, validation, and file operations.
-- The older Qt UI modules remain for reference and are not imported by the current launcher.
 - `SCEWIN_64.exe`, `amifldrv64.sys`, `amigendrv64.sys` are bundled vendor tools/drivers.
 - `icon.ico` contains the app icon asset.
 - `nvram.txt` and `nvram_new.txt` are sample/exported BIOS data files.
