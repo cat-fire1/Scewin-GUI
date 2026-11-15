@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import os
 import re
 import shutil
@@ -11,11 +12,54 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from re import Pattern
+from typing import NamedTuple
 
 from .config import APP_CONFIG, AppConfig
 from .logging_config import get_logger
 
 logger = get_logger("core")
+
+EXPECTED_BINARY_HASHES: dict[str, str] = {
+    "SCEWIN_64.exe": "2d78e7bb62fcab44c54fe853f51e8836ada45ea374027423bcb6d7a5db46502b",
+    "amifldrv64.sys": "e7cbfb16261de1c7f009431d374d90e9eb049ba78246e38bc4c8b9e06f324b6f",
+    "amigendrv64.sys": "ffc72f0bde21ba20aa97bee99d9e96870e5aa40cce9884e44c612757f939494f",
+}
+
+
+class DependencyStatus(NamedTuple):
+    """Result of dependency presence, readability, integrity and HVCI check."""
+
+    ok: bool
+    missing: list[str]
+    unreadable: list[str]
+    tampered: list[str]
+    hvci_active: bool
+
+
+def calculate_sha256(filepath: str) -> str:
+    """Calculate the SHA-256 hash of a file for integrity verification."""
+    sha256 = hashlib.sha256()
+    with open(filepath, "rb") as stream:
+        for block in iter(lambda: stream.read(65536), b""):
+            sha256.update(block)
+    return sha256.hexdigest().lower()
+
+
+def is_hvci_active() -> bool:
+    """Check whether Windows Hypervisor-Enforced Code Integrity (HVCI) is active."""
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity",
+        ) as key:
+            val, _ = winreg.QueryValueEx(key, "Enabled")
+            return bool(val)
+    except (OSError, ImportError):
+        return False
 
 
 class NvramValidationError(ValueError):
@@ -80,6 +124,9 @@ class BiosSetting:
     initial_value: str = ""
     initial_option_id: str = ""
     is_modified: bool = False
+    is_system_register: bool = False
+    is_active_profile: bool = False
+    surrounding_context: list[str] = field(default_factory=list)
 
     # Удобное строковое представление для отладки.
     def __repr__(self) -> str:
@@ -87,7 +134,13 @@ class BiosSetting:
 
     # Устанавливает новое значение и фиксирует факт изменения.
     def set_value(self, new_value: str) -> None:
+        if "\n" in new_value or "\r" in new_value:
+            raise ValueError("Значение NVRAM не должно содержать символов перевода строки")
         clean_new = new_value.strip()
+        if self.is_numeric:
+            raw_stripped = clean_new.strip("<>")
+            if not re.fullmatch(r"(?:0[xX])?[0-9A-Fa-f]+", raw_stripped):
+                raise ValueError(f"Недопустимое числовое значение NVRAM: {new_value!r}")
         clean_current = self.current_value.strip()
 
         if clean_current != clean_new:
@@ -96,6 +149,8 @@ class BiosSetting:
 
     def set_option(self, option_id: str) -> None:
         """Select an enumerated value by its stable SCEWIN identifier."""
+        if "\n" in option_id or "\r" in option_id:
+            raise ValueError("Option ID не должен содержать символов перевода строки")
         if option_id not in self.option_labels:
             raise ValueError(f"Unknown option ID {option_id!r} for {self.name}")
         self.current_option_id = option_id
@@ -153,6 +208,10 @@ class BiosParser:
         (RE_TOKEN, "token"),
         (RE_OFFSET, "offset"),
         (RE_DEFAULT, "bios_default"),
+    )
+    REG_PATTERNS = re.compile(
+        r"(\bPMU\b|\bPHY\b|\bARdPtr|\bAWrPtr|\bRX2D|\bTX2D|\bDFE\b|\bVrefDAC|\bDQ Vref|\bSwing\b|\bEmphasis\b|\bPreshoot\b|\b(?:P[0-3]|R[0-1])\b|drive strengths|impedance)",
+        re.IGNORECASE,
     )
 
     # Основной разбор текстового дампа NVRAM на настройки.
@@ -212,7 +271,55 @@ class BiosParser:
             self._finalize_setting_block(current_setting, len(lines))
             settings.append(current_setting)
 
+        self._classify_settings(settings)
         return NvramDocument(content, settings)
+
+    def _classify_settings(self, settings: list[BiosSetting]) -> None:
+        """Classify system/PHY registers and detect active user profile settings."""
+        count = len(settings)
+        for s in settings:
+            s.is_system_register = (
+                bool(self.REG_PATTERNS.search(s.name))
+                or not s.bios_default
+                or s.bios_default == "-"
+            )
+
+        active_keywords = (
+            "frequency", "speed", "uclk", "fclk", "tcl", "trcd", "trp", "tras",
+            "voltage", "power down", "gear down", "command rate",
+        )
+        active_values = [
+            bool(
+                s.current_value
+                and s.current_value not in ("Auto", "<0>", "0", "-", "[FF]Auto")
+            )
+            for s in settings
+        ]
+        # Each setting contributes to many overlapping neighborhoods. Compute
+        # its contribution once, then count any neighborhood in constant time.
+        active_prefix = [0]
+        for s, has_active_value in zip(settings, active_values):
+            name = s.name.lower()
+            contributes = has_active_value and any(kw in name for kw in active_keywords)
+            active_prefix.append(active_prefix[-1] + contributes)
+
+        for i, s in enumerate(settings):
+            ctx_start = max(0, i - 2)
+            ctx_end = min(count, i + 3)
+            s.surrounding_context = [
+                settings[j].name
+                for j in range(ctx_start, ctx_end)
+                if j != i
+            ]
+
+            if s.is_system_register:
+                continue
+
+            active_neighbors = (
+                active_prefix[min(count, i + 9)] - active_prefix[max(0, i - 8)]
+            )
+            s.is_active_profile = active_values[i] or active_neighbors >= 2
+
 
     # Универсальный разбор метаданных строки по регекспу.
     def _parse_line_for_setting(
@@ -265,6 +372,8 @@ class BiosParser:
                 body = line[: len(line) - len(ending)] if ending else line
                 if setting.is_numeric and self.RE_VALUE_LINE.match(body):
                     value = setting.current_value
+                    if "\r" in value or "\n" in value:
+                        raise ValueError(f"Обнаружена инъекция перевода строки в параметре {setting.name}")
                     if setting.raw_value.startswith("<") and not value.startswith("<"):
                         value = f"<{value}>"
                     lines[index] = body.replace(setting.raw_value, value, 1) + ending
@@ -320,8 +429,17 @@ class BiosService:
     def get_required_files(self) -> list[str]:
         return [self.scewin_path, "amifldrv64.sys", "amigendrv64.sys"]
 
+    def _ensure_dependencies_ok(self) -> None:
+        status = self.check_dependencies()
+        if not status.ok:
+            faults = status.missing + status.unreadable + status.tampered
+            raise RuntimeError(
+                f"Операция SCEWIN отклонена: файлы не прошли проверку безопасности ({', '.join(faults)})"
+            )
+
     def create_export_operation(self, description: str) -> BiosCommand:
         """Prepare an operation that exports the current BIOS configuration."""
+        self._ensure_dependencies_ok()
         return BiosCommand(
             executable=self.resolve_path(self.scewin_path),
             arguments=(
@@ -340,6 +458,7 @@ class BiosService:
         action: str = "import",
     ) -> BiosCommand:
         """Validate a file and prepare a protected BIOS import operation."""
+        self._ensure_dependencies_ok()
         resolved_path = self.validate_nvram_file(filepath)
         return BiosCommand(
             executable=self.resolve_path(self.scewin_path),
@@ -397,11 +516,13 @@ class BiosService:
             )
         except (OSError, NvramValidationError) as error:
             raise SafetyBackupError(f"Не удалось создать обязательный бэкап: {error}") from error
-    # Проверяет наличие необходимых файлов рядом с приложением.
-    def check_dependencies(self) -> tuple[bool, list[str], list[str]]:
-        # Verify required SCEWIN files are present and readable.
+
+    # Проверяет наличие и криптографическую целостность файлов рядом с приложением.
+    def check_dependencies(self) -> DependencyStatus:
+        # Verify required SCEWIN files are present, readable, and authentic.
         missing: list[str] = []
         unreadable: list[str] = []
+        tampered: list[str] = []
         for relative_name in self.get_required_files():
             abs_path = self.resolve_path(relative_name)
             if not os.path.exists(abs_path):
@@ -411,9 +532,40 @@ class BiosService:
                 with open(abs_path, "rb") as binary_file:
                     if not binary_file.read(64):
                         unreadable.append(relative_name)
+                        continue
             except OSError:
                 unreadable.append(relative_name)
-        return len(missing) == 0 and len(unreadable) == 0, missing, unreadable
+                continue
+
+            expected_hash = EXPECTED_BINARY_HASHES.get(relative_name)
+            if expected_hash:
+                try:
+                    actual_hash = calculate_sha256(abs_path)
+                    if actual_hash != expected_hash:
+                        logger.error(
+                            "Integrity check failed for %s: expected %s, got %s",
+                            relative_name,
+                            expected_hash,
+                            actual_hash,
+                        )
+                        tampered.append(relative_name)
+                except OSError:
+                    unreadable.append(relative_name)
+
+        hvci = is_hvci_active()
+        if hvci:
+            logger.warning(
+                "Windows HVCI (Memory Integrity) is active; vulnerable drivers may be blocked"
+            )
+
+        ok = len(missing) == 0 and len(unreadable) == 0 and len(tampered) == 0
+        return DependencyStatus(
+            ok=ok,
+            missing=missing,
+            unreadable=unreadable,
+            tampered=tampered,
+            hvci_active=hvci,
+        )
 
     # Создает резервную копию NVRAM файла с таймстампом.
     def create_backup(self, source: str, backup_dir: str = "backups") -> str:

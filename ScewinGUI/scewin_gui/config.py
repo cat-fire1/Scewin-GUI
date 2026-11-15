@@ -19,7 +19,7 @@ class AppConfig:
     """Immutable runtime configuration shared by all application layers."""
 
     app_name: str = "Scewin GUI"
-    app_version: str = "1.0.0"
+    app_version: str = "4.0.0"
     app_id: str = "ScewinGUI.BiosEditor.v1.0"
     default_language: str = "ru"
     scewin_executable: str = "SCEWIN_64.exe"

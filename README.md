@@ -1,42 +1,73 @@
 # Scewin GUI
 
-A utility with a convenient interface for dumping BIOS to a PC and performing basic edits.
+A Windows desktop utility for reading, editing and applying SCEWIN NVRAM settings.
 
-## Features
+## Download
 
-- Dump BIOS to a file on the PC.
-- Edit available parameters through a graphical interface.
-- Save changes to a file for later flashing/applying.
+**[Download the latest Windows x64 ZIP](https://github.com/cat-fire1/Scewin-GUI/releases/latest/download/ScewinGUI-windows-x64.zip)**
 
-## Requirements
+[Version 4.0.0 release notes and SHA-256 checksum](https://github.com/cat-fire1/Scewin-GUI/releases/tag/v4.0.0)
 
-- Windows x64.
-- Administrator privileges (for access to system settings).
-- SCEWIN drivers/utilities (included in the repository).
+1. Extract the **entire** archive to a writable folder.
+2. Keep `_internal`, `SCEWIN_64.exe` and both `.sys` files beside `ScewinGUI.exe`.
+3. Start `ScewinGUI.exe`. Run as administrator when performing BIOS operations.
 
-## Quick Start
+The packaged application does not require Python or Node.js. Windows x64 and Microsoft Edge WebView2 Runtime are required.
 
-1. Run the application as administrator.
-2. Click "Dump BIOS" and choose a save path.
-3. Open the file in the interface and make changes.
-4. Save the result to a new file.
+## What's new in 4.0.0
 
-## How It Works
+- React + TypeScript interface in a pywebview / WebView2 desktop window.
+- The familiar dark Fluent styling, editor, backup manager and documentation.
+- Plain CSS with shared theme variables for changing colors, fonts, spacing and controls.
+- A virtualized parameter table, search, sorting and register filtering.
+- Russian, Ukrainian and English interface languages.
+- Full-document Save As and changes-only Apply, with validation in Python.
+- Confirmed BIOS writes, serialized operations, vendor-file integrity checks and mandatory safety backups.
+- Explicit BIOS export: starting the application does not run SCEWIN automatically.
 
-<img width="1097" height="747" alt="Screenshot_4" src="https://github.com/user-attachments/assets/a10edbe7-9dd4-4610-a49b-98237b106c74" />
+## Source and development
 
-- The main UI and logic are in `combined_source.py`.
-- BIOS access uses SCEWIN utilities and drivers: `SCEWIN_64.exe`, `amifldrv64.sys`, `amigendrv64.sys`.
-- If you do not trust the .exe files and drivers in the original archive, download it from the official Msi Center website, copy the files to the program folder, or use this script https://github.com/ab3lkaizen/SCEHUB to export .exe files and .sys drivers.
-- The dump is saved as a text file (e.g., `nvram.txt`); edits can be saved to a new file (e.g., `nvram_new.txt`).
-- Keep backups in the `backups/` folder.
+The application source is in [`ScewinGUI/`](ScewinGUI/). The previous Git history and the older `bios` release remain available.
 
-## Important
+```powershell
+cd ScewinGUI
+python -m pip install -r requirements.txt
+npm ci --prefix frontend
+npm run build --prefix frontend
+python main.py
+```
 
-- You modify BIOS at your own risk.
-- Always make a backup before editing.
-- Incorrect parameters can make the device unusable.
+For live interface updates, start `npm run dev --prefix frontend` in one terminal and `python main.py --dev` in another.
+
+- Theme tokens: [`theme.css`](ScewinGUI/frontend/src/styles/theme.css)
+- Component styles: [`app.css`](ScewinGUI/frontend/src/styles/app.css)
+- React pages: [`frontend/src/pages/`](ScewinGUI/frontend/src/pages/)
+- Python bridge: [`desktop_api.py`](ScewinGUI/scewin_gui/desktop_api.py)
+- Parsing, validation and file operations: [`core.py`](ScewinGUI/scewin_gui/core.py)
+- Detailed usage, build and customization instructions: [`ScewinGUI/README.md`](ScewinGUI/README.md)
+
+## Checks and packaging
+
+```powershell
+python -m unittest discover -s tests -v
+python tests/smoke_desktop.py
+python -m pip install pyinstaller
+.\build.ps1
+.\package-release.ps1
+```
+
+Run these commands from `ScewinGUI/`. The smoke test uses synthetic files with 2,400 parameters and blocks all SCEWIN process execution. Release ZIPs exclude user dumps, backups, settings, logs, caches and development dependencies.
+
+## BIOS operations
+
+- **Export** reads BIOS settings into `nvram.txt` and creates a backup.
+- **Apply** saves modified blocks into `nvram_new.txt`; it does not write BIOS.
+- **Save As** writes the full edited document to a new file.
+- **Import file** writes the open file from disk; **Import** writes `nvram_new.txt`.
+- The **Backup** page creates, restores and deletes backups.
+
+Always keep backups before modifying BIOS. Incorrect settings can prevent a device from booting. Keep personal BIOS dumps and backups outside Git and release archives.
 
 ## License
 
-Apache-2.0. All rights reserved by the developer cat_fire.
+[Apache License 2.0](LICENSE). Developed by cat_fire.

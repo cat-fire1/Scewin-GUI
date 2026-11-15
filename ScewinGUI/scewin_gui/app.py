@@ -64,6 +64,20 @@ class SingleInstanceGuard:
         self.release()
 
 
+def secure_dll_search() -> None:
+    """Harden Windows DLL search order against DLL sideloading and search-order hijacking."""
+    if sys.platform != "win32":
+        return
+    try:
+        # Remove current working directory from DLL search order
+        ctypes.windll.kernel32.SetDllDirectoryW("")
+        # Restrict DLL search to application directory and System32 only
+        # LOAD_LIBRARY_SEARCH_APPLICATION_DIR (0x200) | LOAD_LIBRARY_SEARCH_SYSTEM32 (0x800)
+        ctypes.windll.kernel32.SetDefaultDllDirectories(0x00000800 | 0x00000200)
+    except (AttributeError, OSError):
+        logger.debug("Windows SetDefaultDllDirectories is unavailable")
+
+
 def set_windows_app_id() -> None:
     """Register a stable taskbar identity on supported Windows versions."""
     try:
@@ -110,6 +124,7 @@ def show_already_running_message() -> None:
 
 def main(arguments: list[str] | None = None) -> int:
     """Start the GUI and release the mutex for every exit path."""
+    secure_dll_search()
     configure_logging(APP_CONFIG.app_dir / "logs")
     app_arguments = arguments if arguments is not None else sys.argv
 

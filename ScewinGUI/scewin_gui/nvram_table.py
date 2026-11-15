@@ -56,6 +56,18 @@ class NvramTableController:
         name.setFlags(name.flags() ^ Qt.ItemFlag.ItemIsEditable)
         self.table.setItem(row, 0, name)
 
+        token_offset = f"{setting.token} / {setting.offset}" if setting.token or setting.offset else "-"
+        token_item = QTableWidgetItem(token_offset)
+        token_item.setFlags(token_item.flags() ^ Qt.ItemFlag.ItemIsEditable)
+        token_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        if setting.is_system_register:
+            token_item.setForeground(QBrush(QColor(130, 130, 130)))
+        elif setting.is_active_profile:
+            token_item.setForeground(QBrush(QColor(0, 215, 255)))
+        else:
+            token_item.setForeground(QBrush(QColor(210, 210, 210)))
+        self.table.setItem(row, 1, token_item)
+
         if setting.options:
             editor = ComboBox()
             editor.setFixedHeight(APP_CONFIG.widget_height)
@@ -68,7 +80,7 @@ class NvramTableController:
             editor.currentIndexChanged.connect(
                 partial(self._on_option_changed, setting, editor)
             )
-            self.table.setCellWidget(row, 1, editor)
+            self.table.setCellWidget(row, 2, editor)
         elif setting.is_numeric:
             editor = LineEdit()
             editor.setFixedHeight(APP_CONFIG.widget_height)
@@ -80,19 +92,21 @@ class NvramTableController:
                 QRegularExpressionValidator(QRegularExpression(r"^(0x)?[0-9A-Fa-f]+$"))
             )
             editor.editingFinished.connect(partial(self._on_number_changed, setting, editor))
-            self.table.setCellWidget(row, 1, editor)
+            self.table.setCellWidget(row, 2, editor)
         else:
-            self.table.setItem(row, 1, QTableWidgetItem(setting.current_value))
+            item = QTableWidgetItem(setting.current_value)
+            item.setFlags(item.flags() ^ Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 2, item)
 
         default = QTableWidgetItem(setting.bios_default or "-")
         default.setForeground(QBrush(QColor(220, 220, 220)))
         default.setFlags(default.flags() ^ Qt.ItemFlag.ItemIsEditable)
-        self.table.setItem(row, 2, default)
+        self.table.setItem(row, 3, default)
         self.update_status(row, setting)
 
         original_index = QTableWidgetItem()
         original_index.setData(Qt.ItemDataRole.DisplayRole, row)
-        self.table.setItem(row, 4, original_index)
+        self.table.setItem(row, 5, original_index)
 
     def _on_option_changed(self, setting: BiosSetting, editor: ComboBox, _index: int) -> None:
         row = self.table.indexAt(editor.pos()).row()
@@ -109,11 +123,19 @@ class NvramTableController:
         row = self.table.indexAt(editor.pos()).row()
         if row < 0:
             return
-        value = editor.text()
-        value = f"<{value}>" if setting.raw_value.startswith("<") else value
+        raw_text = editor.text().strip()
+        if "\n" in raw_text or "\r" in raw_text:
+            editor.setText(setting.current_value.strip("<>"))
+            return
+        value = f"<{raw_text}>" if setting.raw_value.startswith("<") else raw_text
         if value == setting.current_value:
             return
-        setting.set_value(value)
+        try:
+            setting.set_value(value)
+        except ValueError as error:
+            self.log(str(error))
+            editor.setText(setting.current_value.strip("<>"))
+            return
         self.update_status(row, setting)
         self.log(self.translate("log.changed", name=setting.name, value=value))
 
@@ -124,13 +146,24 @@ class NvramTableController:
             font.setBold(setting.is_modified)
             name.setFont(font)
 
-        status = QTableWidgetItem(
-            self.translate("status.modified") if setting.is_modified else ""
-        )
+        status_text = ""
+        if setting.is_modified:
+            status_text = self.translate("status.modified")
+        elif setting.is_active_profile:
+            status_text = self.translate("status.active")
+        elif setting.is_system_register:
+            status_text = self.translate("status.register")
+
+        status = QTableWidgetItem(status_text)
         status.setFlags(status.flags() ^ Qt.ItemFlag.ItemIsEditable)
-        self.table.setItem(row, 3, status)
-        if not (setting.is_modified or setting.differs_from_default):
-            self.table.removeCellWidget(row, 3)
+        self.table.setItem(row, 4, status)
+        if not (
+            setting.is_modified
+            or setting.differs_from_default
+            or setting.is_system_register
+            or setting.is_active_profile
+        ):
+            self.table.removeCellWidget(row, 4)
             return
 
         status.setForeground(QBrush(QColor(0, 0, 0, 0)))
@@ -143,6 +176,15 @@ class NvramTableController:
             label = BodyLabel(self.translate("status.modified"))
             label.setTextColor(QColor("#00c853"), QColor("#00c853"))
             layout.addWidget(label)
+        elif setting.is_active_profile:
+            label = BodyLabel(self.translate("status.active"))
+            label.setTextColor(QColor("#00d7ff"), QColor("#00d7ff"))
+            layout.addWidget(label)
+        elif setting.is_system_register:
+            label = BodyLabel(self.translate("status.register"))
+            label.setTextColor(QColor("#888888"), QColor("#888888"))
+            layout.addWidget(label)
+
         layout.addStretch(1)
         if setting.differs_from_default:
             reset = TransparentToolButton(FIF.SYNC, self.parent)
@@ -156,7 +198,7 @@ class NvramTableController:
             revert.setFixedSize(26, 26)
             revert.clicked.connect(partial(self.revert, setting))
             layout.addWidget(revert)
-        self.table.setCellWidget(row, 3, container)
+        self.table.setCellWidget(row, 4, container)
 
     def reset(self, setting: BiosSetting) -> None:
         row = self._find_row(setting)
@@ -176,7 +218,7 @@ class NvramTableController:
         self._sync_editor(row, setting)
 
     def _sync_editor(self, row: int, setting: BiosSetting) -> None:
-        editor = self.table.cellWidget(row, 1)
+        editor = self.table.cellWidget(row, 2)
         if isinstance(editor, ComboBox):
             index = editor.findData(setting.current_option_id)
             if index < 0:
@@ -195,23 +237,25 @@ class NvramTableController:
                 return row
         return -1
 
-    def filter(self, text: str) -> None:
+    def filter(self, text: str, hide_registers: bool = False) -> None:
         query = text.lower().strip()
         self.table.setUpdatesEnabled(False)
         try:
             for row in range(self.table.rowCount()):
                 item = self.table.item(row, 0)
-                setting = item.data(Qt.ItemDataRole.UserRole) if item else None
-                matches = bool(
-                    setting
-                    and any(
-                        query in value.lower()
-                        for value in (
-                            setting.name,
-                            setting.help_string,
-                            setting.token,
-                            setting.offset,
-                        )
+                setting: BiosSetting | None = item.data(Qt.ItemDataRole.UserRole) if item else None
+                if not setting:
+                    continue
+                if hide_registers and setting.is_system_register:
+                    self.table.setRowHidden(row, True)
+                    continue
+                matches = not query or any(
+                    query in value.lower()
+                    for value in (
+                        setting.name,
+                        setting.help_string,
+                        setting.token,
+                        setting.offset,
                     )
                 )
                 self.table.setRowHidden(row, not matches)

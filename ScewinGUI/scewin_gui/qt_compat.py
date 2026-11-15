@@ -31,6 +31,7 @@ try:
         TextEdit,
         Theme,
         TitleLabel,
+        ToggleButton,
         TransparentToolButton,
         setTheme,
     )

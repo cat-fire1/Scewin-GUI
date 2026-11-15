@@ -36,6 +36,7 @@ from .qt_compat import (
     TableWidget,
     TextEdit,
     TitleLabel,
+    ToggleButton,
     TransparentToolButton,
 )
 from .ui_common import BiosCommandInterface, DelayedToolTipEventFilter
@@ -47,7 +48,8 @@ BACKUP_DIR = APP_CONFIG.backup_directory
 SEARCH_DEBOUNCE_MS = APP_CONFIG.search_debounce_ms
 SORT_DEBOUNCE_MS = APP_CONFIG.sort_debounce_ms
 AUTO_LOAD_DELAY_MS = APP_CONFIG.auto_load_delay_ms
-COLUMN_WIDTH_PARAM = APP_CONFIG.column_width_parameter
+COLUMN_WIDTH_PARAM = 320
+COLUMN_WIDTH_TOKEN = 110
 COLUMN_WIDTH_VALUE = APP_CONFIG.column_width_value
 COLUMN_WIDTH_DEFAULT = APP_CONFIG.column_width_default
 COLUMN_WIDTH_STATUS = APP_CONFIG.column_width_status
@@ -67,7 +69,7 @@ class NvramTableWidget(TableWidget):
         super().__init__(parent)
         self.setBorderVisible(True)
         self.setBorderRadius(BORDER_RADIUS)
-        self.setColumnCount(5)
+        self.setColumnCount(6)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setShowGrid(False)
@@ -85,10 +87,11 @@ class NvramTableWidget(TableWidget):
         self.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
         self.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         self.setColumnWidth(0, COLUMN_WIDTH_PARAM)
-        self.setColumnWidth(1, COLUMN_WIDTH_VALUE)
-        self.setColumnWidth(2, COLUMN_WIDTH_DEFAULT)
-        self.setColumnWidth(3, COLUMN_WIDTH_STATUS)
-        self.setColumnHidden(4, True)
+        self.setColumnWidth(1, COLUMN_WIDTH_TOKEN)
+        self.setColumnWidth(2, COLUMN_WIDTH_VALUE)
+        self.setColumnWidth(3, COLUMN_WIDTH_DEFAULT)
+        self.setColumnWidth(4, COLUMN_WIDTH_STATUS)
+        self.setColumnHidden(5, True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
 
@@ -185,11 +188,20 @@ class NVRAMInterface(BiosCommandInterface):
         self.lbl_subtitle.setTextColor(QColor(220, 220, 220), QColor(240, 240, 240))
         titles.addWidget(self.lbl_subtitle)
 
+        search_layout = QHBoxLayout()
+        search_layout.setSpacing(8)
         self.search_bar = SearchLineEdit(self)
         self.search_bar.setFixedWidth(SEARCH_BAR_WIDTH)
         self.search_bar.textChanged.connect(self._on_search_changed)
+        search_layout.addWidget(self.search_bar)
+
+        self.btn_hide_registers = ToggleButton(FIF.FILTER, "", self)
+        self.btn_hide_registers.setChecked(False)
+        self.btn_hide_registers.toggled.connect(self._on_hide_registers_toggled)
+        search_layout.addWidget(self.btn_hide_registers)
+
         titles.addStretch(1)
-        titles.addWidget(self.search_bar)
+        titles.addLayout(search_layout)
 
         self.shortcut_search = QShortcut(QKeySequence("Ctrl+F"), self)
         self.shortcut_search.activated.connect(self.search_bar.setFocus)
@@ -342,10 +354,13 @@ class NVRAMInterface(BiosCommandInterface):
         self.lbl_apply_hint.setText(self.t("hint.apply"))
         self.search_bar.setPlaceholderText(self.t("search.placeholder"))
         self.search_bar.setToolTip(self.t("search.tooltip"))
+        self.btn_hide_registers.setText(self.t("button.hide_registers"))
+        self.btn_hide_registers.setToolTip(self.t("tooltip.hide_registers"))
         self.btn_open.setToolTip(self.t("tooltip.open_file"))
         self.table.setHorizontalHeaderLabels(
             [
                 self.t("table.param"),
+                self.t("table.token_offset"),
                 self.t("table.value"),
                 self.t("table.default"),
                 self.t("table.status"),
@@ -362,13 +377,23 @@ class NVRAMInterface(BiosCommandInterface):
 
     # Проверяет наличие зависимостей SCEWIN и сообщает пользователю.
     def check_dependencies(self) -> None:
-        ok, missing, unreadable = self.service.check_dependencies()
-        if not ok:
-            msg = self.t("deps.missing", files=", ".join(missing + unreadable))
+        status = self.service.check_dependencies()
+        if not status.ok:
+            problem_files = status.missing + status.unreadable + status.tampered
+            msg = self.t("deps.missing", files=", ".join(problem_files))
+            if status.tampered:
+                msg += f" (Хеш не совпадает: {', '.join(status.tampered)})"
             self.log(self.t("log.warning", message=msg))
             InfoBar.error(self.t("infobar.startup_error"), msg, duration=5000, parent=self)
         else:
             self.log(self.t("deps.ready"))
+            if status.hvci_active:
+                hvci_msg = (
+                    "Внимание: включена изоляция ядра Windows (HVCI). "
+                    "Драйвер может быть заблокирован системой."
+                )
+                self.log(hvci_msg)
+                InfoBar.warning("Безопасность", hvci_msg, duration=8000, parent=self)
             if not os.path.exists(self.service.resolve_path(NVRAM_FILE)):
                 self.log(self.t("file.not_found_auto", file=NVRAM_FILE))
 
@@ -405,7 +430,10 @@ class NVRAMInterface(BiosCommandInterface):
         self.document = result.document
         self.settings = self.document.settings if self.document else []
         self.table_controller.populate(self.settings)
-        self.table_controller.filter(self.search_bar.text())
+        self.table_controller.filter(
+            self.search_bar.text(),
+            hide_registers=self.btn_hide_registers.isChecked(),
+        )
         self.loaded_filepath = result.filepath
         self.log(self.t("log.loaded", count=len(self.settings)))
         InfoBar.success(
@@ -418,9 +446,13 @@ class NVRAMInterface(BiosCommandInterface):
     def _on_search_changed(self, text: str) -> None:
         self._search_timer.start()
 
+    def _on_hide_registers_toggled(self, _checked: bool) -> None:
+        self._execute_filter()
+
     # Выполняет фильтрацию после задержки.
     def _execute_filter(self) -> None:
-        self.table_controller.filter(self.search_bar.text())
+        hide_reg = self.btn_hide_registers.isChecked()
+        self.table_controller.filter(self.search_bar.text(), hide_registers=hide_reg)
 
     # Обновляет детали при клике по строке таблицы.
     def on_table_click(self, row: int, _column: int) -> None:
@@ -444,7 +476,7 @@ class NVRAMInterface(BiosCommandInterface):
     def _update_details(self, row: int) -> None:
         item = self.table.item(row, 0)
         if item:
-            s = item.data(Qt.ItemDataRole.UserRole)
+            s: BiosSetting = item.data(Qt.ItemDataRole.UserRole)
             self.lbl_p_name.setText(s.name)
             desc = s.help_string or self.t("details.no_description")
             extras = []
@@ -452,15 +484,33 @@ class NVRAMInterface(BiosCommandInterface):
                 extras.append(f"Token: {s.token}")
             if s.offset:
                 extras.append(f"Offset: {s.offset}")
+            if s.width:
+                extras.append(f"Width: {s.width}")
             if extras:
                 desc += "\n\n" + " | ".join(extras)
+
+            if s.is_system_register:
+                desc += (
+                    f"\n\n⚠️ {self.t('details.type_register')}\n"
+                    f"{self.t('details.type_register_warning')}"
+                )
+            elif s.is_active_profile:
+                desc += f"\n\n⭐ {self.t('details.type_active')}"
+            else:
+                desc += f"\n\nℹ️ {self.t('details.type_user')}"
+
+            if s.surrounding_context:
+                desc += f"\n\n{self.t('details.environment')} " + ", ".join(
+                    s.surrounding_context[:4]
+                )
+
             self.lbl_p_desc.setText(desc)
 
     # Управляет состоянием сортировки при клике по заголовку.
     def handle_header_click(self, index: int) -> None:
         header = self.table.horizontalHeader()
 
-        if index == 1:
+        if index == 2:
             header.setSortIndicatorShown(False)
             self.sort_state = {}
             self._pending_sort_index = -1
@@ -502,7 +552,7 @@ class NVRAMInterface(BiosCommandInterface):
         self.table.setUpdatesEnabled(False)
         try:
             if index == -1:
-                self.table.sortItems(4, Qt.SortOrder.AscendingOrder)
+                self.table.sortItems(5, Qt.SortOrder.AscendingOrder)
                 return
 
             next_state = self.sort_state.get(index, 0)
@@ -512,7 +562,7 @@ class NVRAMInterface(BiosCommandInterface):
             elif next_state == 1:
                 self.table.sortItems(index, Qt.SortOrder.AscendingOrder)
             else:
-                self.table.sortItems(4, Qt.SortOrder.AscendingOrder)
+                self.table.sortItems(5, Qt.SortOrder.AscendingOrder)
         finally:
             self.table.setUpdatesEnabled(True)
             self._pending_sort_index = None

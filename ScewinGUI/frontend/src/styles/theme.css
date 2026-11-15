@@ -1,0 +1,32 @@
+/* Customize these tokens to restyle the whole desktop application. */
+:root {
+  color-scheme: dark;
+  --color-window: #202020;
+  --color-sidebar: #202020;
+  --color-page: #272727;
+  --color-card: #2d2d2d;
+  --color-input: #242424;
+  --color-hover: #383838;
+  --color-selected: #373737;
+  --color-border: #414141;
+  --color-border-subtle: #363636;
+  --color-text: #f4f4f4;
+  --color-muted: #ababab;
+  --color-accent: #76b9ed;
+  --color-on-accent: #102330;
+  --color-success: #52d38a;
+  --color-warning: #f0c36e;
+  --color-danger: #ff9c9c;
+  --font-ui: 'Segoe UI Variable', 'Segoe UI', sans-serif;
+  --font-mono: Consolas, monospace;
+  --font-size: 13px;
+  --sidebar-width: 190px;
+  --sidebar-compact-width: 48px;
+  --page-padding: 30px;
+  --layout-gap: 15px;
+  --radius-card: 8px;
+  --radius-control: 5px;
+  --control-height: 32px;
+  --row-height: 42px;
+  --details-height: 145px;
+}
