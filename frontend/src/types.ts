@@ -60,6 +60,24 @@ export type Payload = Record<string, unknown>;
 export type RunAction = (action: Action, payload?: Payload) => Promise<void>;
 export type Translate = (key: string, values?: Record<string, string | number>) => string;
 
+export interface BiosGateway {
+  bootstrap(): Promise<void>;
+  openFile(): Promise<void>;
+  editSetting(id: number, value: string): Promise<void>;
+  draftSetting(id: number, dirty: boolean): Promise<void>;
+  resetSetting(id: number, mode: 'default' | 'initial'): Promise<void>;
+  saveChanges(): Promise<void>;
+  saveAs(): Promise<void>;
+  listBackups(): Promise<void>;
+  createBackup(): Promise<void>;
+  deleteBackup(path: string): Promise<void>;
+  openBackupFolder(): Promise<void>;
+  exportBios(): Promise<void>;
+  importBios(mode: 'import' | 'import_loaded' | 'restore', path?: string): Promise<void>;
+  setLanguage(language: Language): Promise<void>;
+  openExternalLink(link: 'coffee'): Promise<void>;
+}
+
 declare global {
   interface Window {
     pywebview?: {
