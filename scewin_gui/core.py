@@ -7,12 +7,15 @@ import hashlib
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from re import Pattern
-from typing import NamedTuple
+from typing import Callable, NamedTuple, Protocol
 
 from .config import APP_CONFIG, AppConfig
 from .logging_config import get_logger
@@ -70,6 +73,18 @@ class SafetyBackupError(RuntimeError):
     """Raised when a mandatory pre-import backup cannot be created."""
 
 
+class BiosExecutionError(RuntimeError):
+    """Base exception for SCEWIN process execution failures."""
+
+
+class BiosTimeoutError(BiosExecutionError):
+    """Raised when SCEWIN process exceeds the configured timeout."""
+
+
+class BiosPermissionError(BiosExecutionError):
+    """Raised when process lacks administrative privileges."""
+
+
 @dataclass(frozen=True, slots=True)
 class BiosCommand:
     """A validated SCEWIN command prepared by the service layer."""
@@ -83,8 +98,8 @@ class BiosCommand:
 
 
 @dataclass(frozen=True, slots=True)
-class CommandResult:
-    """Structured result emitted by a background SCEWIN worker."""
+class BiosOperationResult:
+    """Structured result emitted by a background SCEWIN worker or BiosExecutor."""
 
     success: bool
     description: str
@@ -92,6 +107,7 @@ class CommandResult:
     stdout: str = ""
     stderr: str = ""
     return_code: int = 0
+    backup_path: str = ""
     error_kind: str = ""
 
     @property
@@ -100,6 +116,52 @@ class CommandResult:
         if self.success:
             return self.stdout.strip()
         return self.stderr.strip() or self.error_kind
+
+
+# Backwards compatibility alias
+CommandResult = BiosOperationResult
+
+
+class ProcessRunner(Protocol):
+    """Seam for executing vendor commands without coupling to subprocess."""
+
+    def __call__(
+        self,
+        command: list[str],
+        timeout: int,
+    ) -> BiosOperationResult:
+        ...
+
+
+def default_process_runner(
+    command: list[str],
+    timeout: int,
+) -> BiosOperationResult:
+    """Execute a system command using Windows-safe subprocess settings."""
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            check=False,
+            timeout=timeout,
+            creationflags=creationflags,
+        )
+        return BiosOperationResult(
+            success=proc.returncode == 0,
+            description=" ".join(command),
+            action="",
+            stdout=proc.stdout or "",
+            stderr=proc.stderr or "",
+            return_code=proc.returncode,
+            error_kind="" if proc.returncode == 0 else (proc.stderr.strip() or proc.stdout.strip() or f"Process error {proc.returncode}"),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise BiosTimeoutError("Таймаут операции SCEWIN") from exc
+    except PermissionError as exc:
+        raise BiosPermissionError("Требуются права администратора для доступа к BIOS") from exc
 
 
 @dataclass(slots=True)
@@ -629,20 +691,294 @@ class BiosService:
             raise
 
     # Загружает текстовый файл с запасными кодировками.
-    def load_file(self, filepath: str) -> str:
-        # Load a text file with fallback encodings.
-        resolved_path = self.resolve_path(filepath)
-        if not os.path.exists(resolved_path):
+    @staticmethod
+    def load_text_file(filepath: str) -> str:
+        """Load a text file with fallback encodings."""
+        if not os.path.exists(filepath):
             raise FileNotFoundError(f"Файл не найден: {filepath}")
         for encoding in ("utf-8", "cp1252"):
             try:
-                with open(resolved_path, encoding=encoding) as source_file:
+                with open(filepath, encoding=encoding) as source_file:
                     return source_file.read()
             except UnicodeDecodeError:
                 continue
-        with open(
-            resolved_path,
-            encoding="utf-8",
-            errors="replace",
-        ) as source_file:
+        with open(filepath, encoding="utf-8", errors="replace") as source_file:
             return source_file.read()
+
+    def load_file(self, filepath: str) -> str:
+        # Load a text file with fallback encodings.
+        resolved_path = self.resolve_path(filepath)
+        return self.load_text_file(resolved_path)
+
+
+@dataclass(frozen=True, slots=True)
+class BackupItem:
+    """Metadata for a verified backup file."""
+
+    path: str
+    name: str
+    mtime: float
+    size: int
+
+
+class BackupVault:
+    """Secure repository managing timestamped NVRAM backup archives."""
+
+    def __init__(self, backup_dir: Path | str, resolve_fn: Callable[[str], str] | None = None) -> None:
+        self.resolve_fn = resolve_fn or (lambda p: str(Path(p).resolve()))
+        self.backup_dir_path = Path(self.resolve_fn(str(backup_dir))).resolve()
+
+    def get_directory(self) -> Path:
+        self.backup_dir_path.mkdir(parents=True, exist_ok=True)
+        return self.backup_dir_path
+
+    def list_all(self) -> list[BackupItem]:
+        if not self.backup_dir_path.exists():
+            return []
+        items: list[BackupItem] = []
+        for path in self.backup_dir_path.iterdir():
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+                items.append(
+                    BackupItem(
+                        path=str(path),
+                        name=path.name,
+                        mtime=stat.st_mtime,
+                        size=stat.st_size,
+                    )
+                )
+            except OSError:
+                continue
+        return sorted(items, key=lambda item: item.mtime, reverse=True)
+
+    def validate_backup_path(self, filepath: str) -> Path:
+        target = Path(self.resolve_fn(filepath)).resolve()
+        if target.parent != self.backup_dir_path or not target.is_file():
+            raise ValueError("Файл не найден в каталоге резервных копий")
+        return target
+
+    def create_backup(self, source_path: str) -> str:
+        resolved_source = self.resolve_fn(source_path)
+        if not os.path.exists(resolved_source):
+            raise FileNotFoundError(f"Файл не найден: {source_path}")
+        self.get_directory()
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        dest = self.backup_dir_path / f"nvram_backup_{timestamp}.txt"
+        shutil.copy(resolved_source, dest)
+        logger.info("Backup created: %s", dest)
+        return str(dest)
+
+    def delete(self, filepath: str) -> None:
+        target = self.validate_backup_path(filepath)
+        target.unlink()
+        logger.info("Backup deleted: %s", target)
+
+    def open_in_explorer(self) -> None:
+        dir_path = self.get_directory()
+        if sys.platform == "win32":
+            os.startfile(str(dir_path))
+
+
+class BiosDocumentSession:
+    """Aggregate managing an active NVRAM document, mutations, drafts, and persistence."""
+
+    def __init__(
+        self,
+        filepath: str,
+        document: NvramDocument,
+        parser: BiosParser | None = None,
+    ) -> None:
+        self.filepath = filepath
+        self.document = document
+        self.document_id = uuid.uuid4().hex
+        self.parser = parser or BiosParser()
+        self._saved_values = self._compute_values()
+        self._drafts: set[int] = set()
+
+    @classmethod
+    def open_file(
+        cls,
+        filepath: str,
+        parser: BiosParser | None = None,
+        load_fn: Callable[[str], str] | None = None,
+    ) -> BiosDocumentSession:
+        p = Path(filepath).resolve()
+        if not p.is_file():
+            raise NvramValidationError(f"Файл не найден: {filepath}")
+        if p.suffix.lower() not in {".txt", ".nvram"}:
+            raise NvramValidationError("Поддерживаются только .txt и .nvram файлы")
+        if p.stat().st_size > 20 * 1024 * 1024:
+            raise NvramValidationError("Размер NVRAM-файла превышает 20 МБ")
+
+        active_parser = parser or BiosParser()
+        if load_fn:
+            content = load_fn(str(p))
+        else:
+            content = BiosService.load_text_file(str(p))
+        if not content.strip():
+            raise NvramValidationError("NVRAM-файл пуст")
+
+        doc = active_parser.parse_file(content)
+        BiosService.validate_settings(doc.settings)
+        return cls(filepath=str(p), document=doc, parser=active_parser)
+
+    def _compute_values(self) -> tuple:
+        return tuple((s.current_value, s.current_option_id) for s in self.document.settings)
+
+    @property
+    def is_dirty(self) -> bool:
+        return bool(self._drafts) or self._compute_values() != self._saved_values
+
+    @property
+    def modified_count(self) -> int:
+        return sum(s.is_modified for s in self.document.settings)
+
+    def get_setting(self, setting_id: int) -> BiosSetting:
+        if type(setting_id) is not int or not 0 <= setting_id < len(self.document.settings):
+            raise ValueError("Invalid setting ID")
+        return self.document.settings[setting_id]
+
+    def edit(self, setting_id: int, value: str) -> BiosSetting:
+        setting = self.get_setting(setting_id)
+        if not isinstance(value, str):
+            raise ValueError("Invalid setting value")
+        if setting.options:
+            setting.set_option(value)
+        elif setting.is_numeric:
+            setting.set_value(f"<{value.strip().strip('<>')}>")
+        else:
+            raise ValueError("Параметр доступен только для чтения")
+        self._drafts.discard(setting_id)
+        return setting
+
+    def set_draft(self, setting_id: int, dirty: bool) -> bool:
+        setting = self.get_setting(setting_id)
+        if not setting.is_numeric or type(dirty) is not bool:
+            raise ValueError("Invalid numeric draft")
+        if dirty:
+            self._drafts.add(setting_id)
+        else:
+            self._drafts.discard(setting_id)
+        return self.is_dirty
+
+    def reset_setting(self, setting_id: int, mode: str) -> BiosSetting:
+        setting = self.get_setting(setting_id)
+        if mode == "default":
+            setting.reset_to_default()
+        elif mode == "initial":
+            setting.reset_to_initial()
+        else:
+            raise ValueError("Unknown reset mode")
+        self._drafts.discard(setting_id)
+        return setting
+
+    def generate_changes(self) -> str:
+        if not any(s.is_modified for s in self.document.settings):
+            raise ValueError("Нет изменённых параметров для сохранения")
+        content = self.parser.generate_changes(self.document)
+        BiosService.validate_nvram_content(content)
+        return content
+
+    def generate_content(self) -> str:
+        content = self.parser.generate_content(self.document)
+        BiosService.validate_nvram_content(content)
+        return content
+
+    def mark_saved(self) -> None:
+        self._drafts.clear()
+        self._saved_values = self._compute_values()
+
+    def save_changes(self, target_path: str, write_fn: Callable[[str, str], None]) -> str:
+        content = self.generate_changes()
+        write_fn(target_path, content)
+        self.mark_saved()
+        return target_path
+
+    def save_as(
+        self,
+        target_path: str,
+        write_fn: Callable[[str, str], None],
+        protected_paths: tuple[str, ...] = (),
+    ) -> str:
+        resolved_target = str(Path(target_path).resolve())
+        for protected in protected_paths:
+            if Path(protected).resolve() == Path(resolved_target):
+                raise ValueError("Нельзя перезаписывать базовый файл экспорта NVRAM")
+        content = self.generate_content()
+        write_fn(resolved_target, content)
+        new_session = self.open_file(resolved_target, parser=self.parser)
+        self.filepath = new_session.filepath
+        self.document = new_session.document
+        self.document_id = new_session.document_id
+        self._saved_values = new_session._saved_values
+        self._drafts.clear()
+        return resolved_target
+
+
+class BiosExecutor:
+    """Coordinates SCEWIN command generation, dependency validation, safety backups, and execution."""
+
+    def __init__(
+        self,
+        service: BiosService,
+        runner: ProcessRunner | None = None,
+        vault: BackupVault | None = None,
+    ) -> None:
+        self.service = service
+        self.runner = runner or default_process_runner
+        self.vault = vault or BackupVault(service.config.backup_directory, resolve_fn=service.resolve_path)
+
+    def execute_export(self, description: str = "Экспорт BIOS") -> BiosOperationResult:
+        self.service._ensure_dependencies_ok()
+        exe = self.service.resolve_path(self.service.scewin_path)
+        out_file = self.service.resolve_path(self.service.config.nvram_file)
+        cmd = [exe, "/o", "/s", out_file]
+
+        logger.info("Executing BIOS export: %s", cmd)
+        cmd_result = self.runner(cmd, self.service.config.subprocess_timeout_seconds)
+        if not cmd_result.success:
+            raise BiosExecutionError(cmd_result.detail or f"SCEWIN exited with code {cmd_result.return_code}")
+
+        # Invariant: Auto-backup on successful export
+        backup_path = self.vault.create_backup(out_file)
+        return BiosOperationResult(
+            success=True,
+            description=description,
+            action="export",
+            stdout=cmd_result.stdout,
+            stderr=cmd_result.stderr,
+            return_code=cmd_result.return_code,
+            backup_path=backup_path,
+        )
+
+    def execute_import(
+        self,
+        nvram_path: str,
+        description: str = "Импорт BIOS",
+        action: str = "import",
+    ) -> BiosOperationResult:
+        self.service._ensure_dependencies_ok()
+        resolved_file = self.service.validate_nvram_file(nvram_path)
+
+        # Invariant: Mandatory safety backup before writing to BIOS
+        safety_backup_path = self.service.create_safety_backup()
+
+        exe = self.service.resolve_path(self.service.scewin_path)
+        cmd = [exe, "/i", "/s", resolved_file]
+
+        logger.info("Executing BIOS import (%s): %s", action, cmd)
+        cmd_result = self.runner(cmd, self.service.config.subprocess_timeout_seconds)
+        if not cmd_result.success:
+            raise BiosExecutionError(cmd_result.detail or f"SCEWIN exited with code {cmd_result.return_code}")
+
+        return BiosOperationResult(
+            success=True,
+            description=description,
+            action=action,
+            stdout=cmd_result.stdout,
+            stderr=cmd_result.stderr,
+            return_code=cmd_result.return_code,
+            backup_path=safety_backup_path,
+        )
