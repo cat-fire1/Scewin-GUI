@@ -1,0 +1,984 @@
+"""BIOS data models, NVRAM parser, validation, and filesystem service."""
+
+from __future__ import annotations
+
+import datetime
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+from contextlib import suppress
+from dataclasses import dataclass, field
+from pathlib import Path
+from re import Pattern
+from typing import Callable, NamedTuple, Protocol
+
+from .config import APP_CONFIG, AppConfig
+from .logging_config import get_logger
+
+logger = get_logger("core")
+
+EXPECTED_BINARY_HASHES: dict[str, str] = {
+    "SCEWIN_64.exe": "2d78e7bb62fcab44c54fe853f51e8836ada45ea374027423bcb6d7a5db46502b",
+    "amifldrv64.sys": "e7cbfb16261de1c7f009431d374d90e9eb049ba78246e38bc4c8b9e06f324b6f",
+    "amigendrv64.sys": "ffc72f0bde21ba20aa97bee99d9e96870e5aa40cce9884e44c612757f939494f",
+}
+
+
+class DependencyStatus(NamedTuple):
+    """Result of dependency presence, readability, integrity and HVCI check."""
+
+    ok: bool
+    missing: list[str]
+    unreadable: list[str]
+    tampered: list[str]
+    hvci_active: bool
+
+
+def calculate_sha256(filepath: str) -> str:
+    """Calculate the SHA-256 hash of a file for integrity verification."""
+    sha256 = hashlib.sha256()
+    with open(filepath, "rb") as stream:
+        for block in iter(lambda: stream.read(65536), b""):
+            sha256.update(block)
+    return sha256.hexdigest().lower()
+
+
+def is_hvci_active() -> bool:
+    """Check whether Windows Hypervisor-Enforced Code Integrity (HVCI) is active."""
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity",
+        ) as key:
+            val, _ = winreg.QueryValueEx(key, "Enabled")
+            return bool(val)
+    except (OSError, ImportError):
+        return False
+
+
+class NvramValidationError(ValueError):
+    """Raised when a selected file is not a valid SCEWIN NVRAM document."""
+
+
+class SafetyBackupError(RuntimeError):
+    """Raised when a mandatory pre-import backup cannot be created."""
+
+
+class BiosExecutionError(RuntimeError):
+    """Base exception for SCEWIN process execution failures."""
+
+
+class BiosTimeoutError(BiosExecutionError):
+    """Raised when SCEWIN process exceeds the configured timeout."""
+
+
+class BiosPermissionError(BiosExecutionError):
+    """Raised when process lacks administrative privileges."""
+
+
+@dataclass(frozen=True, slots=True)
+class BiosCommand:
+    """A validated SCEWIN command prepared by the service layer."""
+
+    executable: str
+    arguments: tuple[str, ...]
+    description: str
+    action: str
+    dangerous: bool = False
+    requires_backup: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class BiosOperationResult:
+    """Structured result emitted by a background SCEWIN worker or BiosExecutor."""
+
+    success: bool
+    description: str
+    action: str
+    stdout: str = ""
+    stderr: str = ""
+    return_code: int = 0
+    backup_path: str = ""
+    error_kind: str = ""
+
+    @property
+    def detail(self) -> str:
+        """Return the most useful diagnostic text for the UI and logs."""
+        if self.success:
+            return self.stdout.strip()
+        return self.stderr.strip() or self.error_kind
+
+
+# Backwards compatibility alias
+CommandResult = BiosOperationResult
+
+
+class ProcessRunner(Protocol):
+    """Seam for executing vendor commands without coupling to subprocess."""
+
+    def __call__(
+        self,
+        command: list[str],
+        timeout: int,
+    ) -> BiosOperationResult:
+        ...
+
+
+def default_process_runner(
+    command: list[str],
+    timeout: int,
+) -> BiosOperationResult:
+    """Execute a system command using Windows-safe subprocess settings."""
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            check=False,
+            timeout=timeout,
+            creationflags=creationflags,
+        )
+        return BiosOperationResult(
+            success=proc.returncode == 0,
+            description=" ".join(command),
+            action="",
+            stdout=proc.stdout or "",
+            stderr=proc.stderr or "",
+            return_code=proc.returncode,
+            error_kind="" if proc.returncode == 0 else (proc.stderr.strip() or proc.stdout.strip() or f"Process error {proc.returncode}"),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise BiosTimeoutError("Таймаут операции SCEWIN") from exc
+    except PermissionError as exc:
+        raise BiosPermissionError("Требуются права администратора для доступа к BIOS") from exc
+
+
+@dataclass(slots=True)
+class BiosSetting:
+    """One editable BIOS setup entry and its original file block."""
+
+    name: str = ""
+    help_string: str = ""
+    token: str = ""
+    offset: str = ""
+    width: str = ""
+    bios_default: str = ""
+    default_option_id: str = ""
+    current_value: str = ""
+    current_option_id: str = ""
+    options: list[tuple[str, str]] = field(default_factory=list)
+    option_labels: dict[str, str] = field(default_factory=dict)
+    raw_value: str = ""
+    is_numeric: bool = False
+    line_start: int = 0
+    line_end: int = 0
+    initial_value: str = ""
+    initial_option_id: str = ""
+    is_modified: bool = False
+    is_system_register: bool = False
+    is_active_profile: bool = False
+    surrounding_context: list[str] = field(default_factory=list)
+
+    # Удобное строковое представление для отладки.
+    def __repr__(self) -> str:
+        return f"<BiosSetting {self.name}: {self.current_value}>"
+
+    # Устанавливает новое значение и фиксирует факт изменения.
+    def set_value(self, new_value: str) -> None:
+        if "\n" in new_value or "\r" in new_value:
+            raise ValueError("Значение NVRAM не должно содержать символов перевода строки")
+        clean_new = new_value.strip()
+        if self.is_numeric:
+            raw_stripped = clean_new.strip("<>")
+            if not re.fullmatch(r"(?:0[xX])?[0-9A-Fa-f]+", raw_stripped):
+                raise ValueError(f"Недопустимое числовое значение NVRAM: {new_value!r}")
+        clean_current = self.current_value.strip()
+
+        if clean_current != clean_new:
+            self.current_value = clean_new
+            self.is_modified = clean_new != self.initial_value
+
+    def set_option(self, option_id: str) -> None:
+        """Select an enumerated value by its stable SCEWIN identifier."""
+        if "\n" in option_id or "\r" in option_id:
+            raise ValueError("Option ID не должен содержать символов перевода строки")
+        if option_id not in self.option_labels:
+            raise ValueError(f"Unknown option ID {option_id!r} for {self.name}")
+        self.current_option_id = option_id
+        self.current_value = self.option_labels[option_id]
+        self.is_modified = option_id != self.initial_option_id
+
+    @property
+    def differs_from_default(self) -> bool:
+        if self.default_option_id:
+            return self.current_option_id != self.default_option_id
+        if self.options:
+            return False
+        return bool(
+            self.bios_default
+            and self.bios_default != "-"
+            and self.current_value.strip() != self.bios_default.strip()
+        )
+
+    # Сбрасывает значение на BIOS Default, если доступно.
+    def reset_to_default(self) -> None:
+        if self.default_option_id:
+            self.set_option(self.default_option_id)
+        elif not self.options and self.bios_default and self.bios_default != "-":
+            self.set_value(self.bios_default)
+
+    # Возвращает значение к исходному состоянию.
+    def reset_to_initial(self) -> None:
+        self.current_option_id = self.initial_option_id
+        self.current_value = self.initial_value
+        self.is_modified = False
+
+
+@dataclass(slots=True)
+class NvramDocument:
+    """A parsed NVRAM document with its exact original source text."""
+
+    source: str
+    settings: list[BiosSetting]
+
+
+class BiosParser:
+    """Parse SCEWIN NVRAM text and rebuild changed setting blocks."""
+
+    RE_QUESTION = re.compile(r"^\s*Setup Question\s*=\s*(.*)")
+    RE_HELP = re.compile(r"^\s*Help String\s*=\s*(.*)")
+    RE_TOKEN = re.compile(r"^\s*Token\s*=\s*(.*)")
+    RE_OFFSET = re.compile(r"^\s*Offset\s*=\s*(.*)")
+    RE_DEFAULT = re.compile(r"^\s*BIOS Default\s*=\s*(.*)")
+    RE_VALUE = re.compile(r"^\s*Value\s*=\s*(.*)")
+    RE_OPTION = re.compile(r"(\*?)\[([0-9A-Fa-f]+)\]\s*(.*)")
+    RE_OPTION_LINE = re.compile(r"^(.*?)(\*?)(\[[0-9A-Fa-f]+\]\s*)(.*)$")
+    RE_VALUE_LINE = re.compile(r"^(\s*Value\s*=\s*)(.*)")
+    META_FIELDS: tuple[tuple[Pattern[str], str], ...] = (
+        (RE_HELP, "help_string"),
+        (RE_TOKEN, "token"),
+        (RE_OFFSET, "offset"),
+        (RE_DEFAULT, "bios_default"),
+    )
+    REG_PATTERNS = re.compile(
+        r"(\bPMU\b|\bPHY\b|\bARdPtr|\bAWrPtr|\bRX2D|\bTX2D|\bDFE\b|\bVrefDAC|\bDQ Vref|\bSwing\b|\bEmphasis\b|\bPreshoot\b|\b(?:P[0-3]|R[0-1])\b|drive strengths|impedance)",
+        re.IGNORECASE,
+    )
+
+    # Основной разбор текстового дампа NVRAM на настройки.
+    def parse_file(self, content: str) -> NvramDocument:
+        # Parse raw NVRAM text into one explicit document object.
+        settings: list[BiosSetting] = []
+        lines = content.splitlines()
+        current_setting: BiosSetting | None = None
+
+        for i, line in enumerate(lines):
+            if "=" not in line and "[" not in line:
+                continue
+            match_question = self.RE_QUESTION.match(line)
+            if match_question:
+                if current_setting:
+                    self._finalize_setting_block(current_setting, i)
+                    settings.append(current_setting)
+                current_setting = BiosSetting()
+                current_setting.line_start = i
+                current_setting.name = match_question.group(1).strip()
+                continue
+
+            if current_setting:
+                for regex, attribute in self.META_FIELDS:
+                    self._parse_line_for_setting(
+                        current_setting,
+                        line,
+                        regex,
+                        attribute,
+                    )
+
+                match_value = self.RE_VALUE.match(line)
+                if match_value:
+                    val = match_value.group(1).split("//")[0].strip()
+                    current_setting.raw_value = val
+                    if not current_setting.current_value:
+                        current_setting.current_value = val
+                    current_setting.is_numeric = True
+                    continue
+
+                if "[" in line and "]" in line:
+                    match_opt = self.RE_OPTION.search(line)
+                    if match_opt:
+                        is_active = match_opt.group(1) == "*"
+                        opt_id = match_opt.group(2)
+                        remainder = match_opt.group(3)
+                        opt_text = remainder.split("//")[0].strip()
+
+                        current_setting.options.append((opt_id, opt_text))
+                        current_setting.option_labels[opt_id] = opt_text
+
+                        if is_active:
+                            current_setting.current_option_id = opt_id
+                            current_setting.current_value = opt_text
+
+        if current_setting:
+            self._finalize_setting_block(current_setting, len(lines))
+            settings.append(current_setting)
+
+        self._classify_settings(settings)
+        return NvramDocument(content, settings)
+
+    def _classify_settings(self, settings: list[BiosSetting]) -> None:
+        """Classify system/PHY registers and detect active user profile settings."""
+        count = len(settings)
+        for s in settings:
+            s.is_system_register = (
+                bool(self.REG_PATTERNS.search(s.name))
+                or not s.bios_default
+                or s.bios_default == "-"
+            )
+
+        active_keywords = (
+            "frequency", "speed", "uclk", "fclk", "tcl", "trcd", "trp", "tras",
+            "voltage", "power down", "gear down", "command rate",
+        )
+        active_values = [
+            bool(
+                s.current_value
+                and s.current_value not in ("Auto", "<0>", "0", "-", "[FF]Auto")
+            )
+            for s in settings
+        ]
+        # Each setting contributes to many overlapping neighborhoods. Compute
+        # its contribution once, then count any neighborhood in constant time.
+        active_prefix = [0]
+        for s, has_active_value in zip(settings, active_values):
+            name = s.name.lower()
+            contributes = has_active_value and any(kw in name for kw in active_keywords)
+            active_prefix.append(active_prefix[-1] + contributes)
+
+        for i, s in enumerate(settings):
+            ctx_start = max(0, i - 2)
+            ctx_end = min(count, i + 3)
+            s.surrounding_context = [
+                settings[j].name
+                for j in range(ctx_start, ctx_end)
+                if j != i
+            ]
+
+            if s.is_system_register:
+                continue
+
+            active_neighbors = (
+                active_prefix[min(count, i + 9)] - active_prefix[max(0, i - 8)]
+            )
+            s.is_active_profile = active_values[i] or active_neighbors >= 2
+
+
+    # Универсальный разбор метаданных строки по регекспу.
+    def _parse_line_for_setting(
+        self,
+        setting: BiosSetting,
+        line: str,
+        regex: Pattern[str],
+        attribute: str,
+    ) -> None:
+        # Extract a single metadata field from a line when it matches.
+        match = regex.match(line)
+        if match:
+            val = match.group(1).split("//")[0].strip()
+            setattr(setting, attribute, val)
+
+    # Завершает блок настройки и сохраняет исходные строки.
+    def _finalize_setting_block(
+        self,
+        setting: BiosSetting,
+        current_line_idx: int,
+    ) -> None:
+        # Finalize a setting block and retain its source range.
+        setting.line_end = current_line_idx - 1
+        if setting.bios_default:
+            match = re.match(r"(?:\[([0-9A-Fa-f]+)\])?(.*)", setting.bios_default)
+            if match:
+                setting.default_option_id = match.group(1) or ""
+                setting.bios_default = match.group(2).strip()
+                if not setting.default_option_id and setting.options:
+                    exact_ids = [
+                        option_id
+                        for option_id, label in setting.options
+                        if label == setting.bios_default
+                    ]
+                    if len(exact_ids) == 1:
+                        setting.default_option_id = exact_ids[0]
+        setting.initial_value = setting.current_value
+        setting.initial_option_id = setting.current_option_id
+
+    # Собирает новый текст NVRAM с учетом измененных значений.
+    def generate_content(self, document: NvramDocument) -> str:
+        """Patch only modified value lines and preserve all other source bytes."""
+        lines = document.source.splitlines(keepends=True)
+        for setting in document.settings:
+            if not setting.is_modified:
+                continue
+            for index in range(setting.line_start, setting.line_end + 1):
+                line = lines[index]
+                ending = line[len(line.rstrip("\r\n")) :]
+                body = line[: len(line) - len(ending)] if ending else line
+                if setting.is_numeric and self.RE_VALUE_LINE.match(body):
+                    value = setting.current_value
+                    if "\r" in value or "\n" in value:
+                        raise ValueError(f"Обнаружена инъекция перевода строки в параметре {setting.name}")
+                    if setting.raw_value.startswith("<") and not value.startswith("<"):
+                        value = f"<{value}>"
+                    lines[index] = body.replace(setting.raw_value, value, 1) + ending
+                    continue
+                match = self.RE_OPTION_LINE.match(body)
+                if not match or "Setup Question" in body or "BIOS Default" in body:
+                    continue
+                prefix, _, bracket_part, remainder = match.groups()
+                option_id = bracket_part.lstrip("[").split("]", 1)[0]
+                marker = "*" if option_id == setting.current_option_id else ""
+                lines[index] = f"{prefix}{marker}{bracket_part}{remainder}{ending}"
+        return "".join(lines)
+
+    def generate_changes(self, document: NvramDocument) -> str:
+        """Render the exact source prefix followed by modified setting blocks."""
+        rendered_lines = self.generate_content(document).splitlines(keepends=True)
+        newline = "\r\n" if "\r\n" in document.source else "\n"
+        first_setting_line = min(
+            (setting.line_start for setting in document.settings),
+            default=len(rendered_lines),
+        )
+        prefix = "".join(rendered_lines[:first_setting_line])
+        blocks = [
+            "".join(rendered_lines[setting.line_start : setting.line_end + 1]).rstrip(
+                "\r\n"
+            )
+            for setting in document.settings
+            if setting.is_modified
+        ]
+        return prefix + (newline * 2).join(blocks) + (newline if blocks else "")
+
+
+class BiosService:
+    """Validate files and prepare safe SCEWIN operations."""
+
+    # Сохраняет путь к исполняемому файлу SCEWIN.
+    def __init__(
+        self,
+        scewin_path: str | None = None,
+        config: AppConfig = APP_CONFIG,
+        base_dir: str | Path | None = None,
+    ) -> None:
+        self.config = config
+        self.base_dir = str(Path(base_dir).resolve()) if base_dir else str(config.app_dir)
+        self.scewin_path = scewin_path or config.scewin_executable
+
+    def resolve_path(self, path: str) -> str:
+        # Resolve relative paths against the application directory.
+        if os.path.isabs(path):
+            return path
+        return os.path.join(self.base_dir, path)
+
+    def get_required_files(self) -> list[str]:
+        return [self.scewin_path, "amifldrv64.sys", "amigendrv64.sys"]
+
+    def _ensure_dependencies_ok(self) -> None:
+        status = self.check_dependencies()
+        if not status.ok:
+            faults = status.missing + status.unreadable + status.tampered
+            raise RuntimeError(
+                f"Операция SCEWIN отклонена: файлы не прошли проверку безопасности ({', '.join(faults)})"
+            )
+
+    def create_export_operation(self, description: str) -> BiosCommand:
+        """Prepare an operation that exports the current BIOS configuration."""
+        self._ensure_dependencies_ok()
+        return BiosCommand(
+            executable=self.resolve_path(self.scewin_path),
+            arguments=(
+                "/o",
+                "/s",
+                self.resolve_path(self.config.nvram_file),
+            ),
+            description=description,
+            action="export",
+        )
+
+    def create_import_operation(
+        self,
+        filepath: str,
+        description: str,
+        action: str = "import",
+    ) -> BiosCommand:
+        """Validate a file and prepare a protected BIOS import operation."""
+        self._ensure_dependencies_ok()
+        resolved_path = self.validate_nvram_file(filepath)
+        return BiosCommand(
+            executable=self.resolve_path(self.scewin_path),
+            arguments=("/i", "/s", resolved_path),
+            description=description,
+            action=action,
+            dangerous=True,
+            requires_backup=True,
+        )
+
+    def validate_nvram_file(self, filepath: str) -> str:
+        """Validate the path, extension, size, and parsed NVRAM structure."""
+        resolved_path = self.resolve_path(filepath)
+        path = Path(resolved_path)
+        if not path.is_file():
+            raise NvramValidationError(f"Файл не найден: {filepath}")
+        if path.suffix.lower() not in {".txt", ".nvram"}:
+            raise NvramValidationError("Поддерживаются только .txt и .nvram файлы")
+        if path.stat().st_size > 20 * 1024 * 1024:
+            raise NvramValidationError("Размер NVRAM-файла превышает 20 МБ")
+        content = self.load_file(resolved_path)
+        self.validate_nvram_content(content)
+        return resolved_path
+
+    @staticmethod
+    def validate_nvram_content(content: str) -> NvramDocument:
+        """Parse content and reject empty or structurally invalid documents."""
+        if not content.strip():
+            raise NvramValidationError("NVRAM-файл пуст")
+        document = BiosParser().parse_file(content)
+        BiosService.validate_settings(document.settings)
+        return document
+
+    @staticmethod
+    def validate_settings(settings: list[BiosSetting]) -> None:
+        """Reject parsed results that cannot represent a safe import."""
+        if not settings:
+            raise NvramValidationError("В файле не найдено ни одного параметра Setup Question")
+        invalid = [setting for setting in settings if not setting.name.strip()]
+        if invalid:
+            raise NvramValidationError("Обнаружен параметр без имени")
+
+    def create_safety_backup(self) -> str:
+        """Create the mandatory backup required before every BIOS import."""
+        source = self.resolve_path(self.config.nvram_file)
+        if not os.path.isfile(source):
+            raise SafetyBackupError(
+                "Нельзя записывать BIOS без актуального nvram.txt. Сначала выполните экспорт."
+            )
+        try:
+            self.validate_nvram_file(source)
+            return self.create_backup(
+                self.config.nvram_file,
+                self.config.backup_directory,
+            )
+        except (OSError, NvramValidationError) as error:
+            raise SafetyBackupError(f"Не удалось создать обязательный бэкап: {error}") from error
+
+    # Проверяет наличие и криптографическую целостность файлов рядом с приложением.
+    def check_dependencies(self) -> DependencyStatus:
+        # Verify required SCEWIN files are present, readable, and authentic.
+        missing: list[str] = []
+        unreadable: list[str] = []
+        tampered: list[str] = []
+        for relative_name in self.get_required_files():
+            abs_path = self.resolve_path(relative_name)
+            if not os.path.exists(abs_path):
+                missing.append(relative_name)
+                continue
+            try:
+                with open(abs_path, "rb") as binary_file:
+                    if not binary_file.read(64):
+                        unreadable.append(relative_name)
+                        continue
+            except OSError:
+                unreadable.append(relative_name)
+                continue
+
+            expected_hash = EXPECTED_BINARY_HASHES.get(relative_name)
+            if expected_hash:
+                try:
+                    actual_hash = calculate_sha256(abs_path)
+                    if actual_hash != expected_hash:
+                        logger.error(
+                            "Integrity check failed for %s: expected %s, got %s",
+                            relative_name,
+                            expected_hash,
+                            actual_hash,
+                        )
+                        tampered.append(relative_name)
+                except OSError:
+                    unreadable.append(relative_name)
+
+        hvci = is_hvci_active()
+        if hvci:
+            logger.warning(
+                "Windows HVCI (Memory Integrity) is active; vulnerable drivers may be blocked"
+            )
+
+        ok = len(missing) == 0 and len(unreadable) == 0 and len(tampered) == 0
+        return DependencyStatus(
+            ok=ok,
+            missing=missing,
+            unreadable=unreadable,
+            tampered=tampered,
+            hvci_active=hvci,
+        )
+
+    # Создает резервную копию NVRAM файла с таймстампом.
+    def create_backup(self, source: str, backup_dir: str = "backups") -> str:
+        """Copy an NVRAM file into a uniquely timestamped backup."""
+        source_path = self.resolve_path(source)
+        backup_path = self.resolve_path(backup_dir)
+        if not os.path.exists(source_path):
+            raise FileNotFoundError(f"Файл не найден: {source}")
+        os.makedirs(backup_path, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        dest = os.path.join(backup_path, f"nvram_backup_{timestamp}.txt")
+        shutil.copy(source_path, dest)
+        logger.info("Backup created: %s", dest)
+        return dest
+
+    def list_backups(self) -> list[tuple[str, float, int]]:
+        """Return backup path, modification time, and size, newest first."""
+        backup_path = Path(self.resolve_path(self.config.backup_directory))
+        if not backup_path.exists():
+            return []
+        items: list[tuple[str, float, int]] = []
+        for path in backup_path.iterdir():
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                logger.warning("Cannot stat backup: %s", path)
+                continue
+            items.append((str(path), stat.st_mtime, stat.st_size))
+        return sorted(items, key=lambda item: item[1], reverse=True)
+
+    def delete_backup(self, filepath: str) -> None:
+        """Delete only files located directly inside the backup directory."""
+        backup_dir = Path(self.resolve_path(self.config.backup_directory)).resolve()
+        target = Path(filepath).resolve()
+        if target.parent != backup_dir:
+            raise ValueError("Удаление разрешено только в папке бэкапов")
+        target.unlink()
+        logger.info("Backup deleted: %s", target)
+
+    # Пишет файл через временный файл для атомарности.
+    def atomic_write(self, filepath: str, content: str) -> None:
+        # Write data using a temp file and atomic replace.
+        target_path = self.resolve_path(filepath)
+        dir_path = os.path.dirname(target_path) or self.base_dir
+        temp_fd, temp_path = tempfile.mkstemp(
+            dir=dir_path,
+            prefix=".tmp_nvram_",
+            suffix=".txt",
+        )
+        try:
+            with os.fdopen(temp_fd, "w", encoding="utf-8") as temp_file:
+                temp_file.write(content)
+            os.replace(temp_path, target_path)
+            logger.info("File written atomically: %s", target_path)
+        except OSError:
+            if os.path.exists(temp_path):
+                with suppress(OSError):
+                    os.unlink(temp_path)
+            raise
+
+    # Загружает текстовый файл с запасными кодировками.
+    @staticmethod
+    def load_text_file(filepath: str) -> str:
+        """Load a text file with fallback encodings."""
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Файл не найден: {filepath}")
+        for encoding in ("utf-8", "cp1252"):
+            try:
+                with open(filepath, encoding=encoding) as source_file:
+                    return source_file.read()
+            except UnicodeDecodeError:
+                continue
+        with open(filepath, encoding="utf-8", errors="replace") as source_file:
+            return source_file.read()
+
+    def load_file(self, filepath: str) -> str:
+        # Load a text file with fallback encodings.
+        resolved_path = self.resolve_path(filepath)
+        return self.load_text_file(resolved_path)
+
+
+@dataclass(frozen=True, slots=True)
+class BackupItem:
+    """Metadata for a verified backup file."""
+
+    path: str
+    name: str
+    mtime: float
+    size: int
+
+
+class BackupVault:
+    """Secure repository managing timestamped NVRAM backup archives."""
+
+    def __init__(self, backup_dir: Path | str, resolve_fn: Callable[[str], str] | None = None) -> None:
+        self.resolve_fn = resolve_fn or (lambda p: str(Path(p).resolve()))
+        self.backup_dir_path = Path(self.resolve_fn(str(backup_dir))).resolve()
+
+    def get_directory(self) -> Path:
+        self.backup_dir_path.mkdir(parents=True, exist_ok=True)
+        return self.backup_dir_path
+
+    def list_all(self) -> list[BackupItem]:
+        if not self.backup_dir_path.exists():
+            return []
+        items: list[BackupItem] = []
+        for path in self.backup_dir_path.iterdir():
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+                items.append(
+                    BackupItem(
+                        path=str(path),
+                        name=path.name,
+                        mtime=stat.st_mtime,
+                        size=stat.st_size,
+                    )
+                )
+            except OSError:
+                continue
+        return sorted(items, key=lambda item: item.mtime, reverse=True)
+
+    def validate_backup_path(self, filepath: str) -> Path:
+        target = Path(self.resolve_fn(filepath)).resolve()
+        if target.parent != self.backup_dir_path or not target.is_file():
+            raise ValueError("Файл не найден в каталоге резервных копий")
+        return target
+
+    def create_backup(self, source_path: str) -> str:
+        resolved_source = self.resolve_fn(source_path)
+        if not os.path.exists(resolved_source):
+            raise FileNotFoundError(f"Файл не найден: {source_path}")
+        self.get_directory()
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        dest = self.backup_dir_path / f"nvram_backup_{timestamp}.txt"
+        shutil.copy(resolved_source, dest)
+        logger.info("Backup created: %s", dest)
+        return str(dest)
+
+    def delete(self, filepath: str) -> None:
+        target = self.validate_backup_path(filepath)
+        target.unlink()
+        logger.info("Backup deleted: %s", target)
+
+    def open_in_explorer(self) -> None:
+        dir_path = self.get_directory()
+        if sys.platform == "win32":
+            os.startfile(str(dir_path))
+
+
+class BiosDocumentSession:
+    """Aggregate managing an active NVRAM document, mutations, drafts, and persistence."""
+
+    def __init__(
+        self,
+        filepath: str,
+        document: NvramDocument,
+        parser: BiosParser | None = None,
+    ) -> None:
+        self.filepath = filepath
+        self.document = document
+        self.document_id = uuid.uuid4().hex
+        self.parser = parser or BiosParser()
+        self._saved_values = self._compute_values()
+        self._drafts: set[int] = set()
+
+    @classmethod
+    def open_file(
+        cls,
+        filepath: str,
+        parser: BiosParser | None = None,
+        load_fn: Callable[[str], str] | None = None,
+    ) -> BiosDocumentSession:
+        p = Path(filepath).resolve()
+        if not p.is_file():
+            raise NvramValidationError(f"Файл не найден: {filepath}")
+        if p.suffix.lower() not in {".txt", ".nvram"}:
+            raise NvramValidationError("Поддерживаются только .txt и .nvram файлы")
+        if p.stat().st_size > 20 * 1024 * 1024:
+            raise NvramValidationError("Размер NVRAM-файла превышает 20 МБ")
+
+        active_parser = parser or BiosParser()
+        if load_fn:
+            content = load_fn(str(p))
+        else:
+            content = BiosService.load_text_file(str(p))
+        if not content.strip():
+            raise NvramValidationError("NVRAM-файл пуст")
+
+        doc = active_parser.parse_file(content)
+        BiosService.validate_settings(doc.settings)
+        return cls(filepath=str(p), document=doc, parser=active_parser)
+
+    def _compute_values(self) -> tuple:
+        return tuple((s.current_value, s.current_option_id) for s in self.document.settings)
+
+    @property
+    def is_dirty(self) -> bool:
+        return bool(self._drafts) or self._compute_values() != self._saved_values
+
+    @property
+    def modified_count(self) -> int:
+        return sum(s.is_modified for s in self.document.settings)
+
+    def get_setting(self, setting_id: int) -> BiosSetting:
+        if type(setting_id) is not int or not 0 <= setting_id < len(self.document.settings):
+            raise ValueError("Invalid setting ID")
+        return self.document.settings[setting_id]
+
+    def edit(self, setting_id: int, value: str) -> BiosSetting:
+        setting = self.get_setting(setting_id)
+        if not isinstance(value, str):
+            raise ValueError("Invalid setting value")
+        if setting.options:
+            setting.set_option(value)
+        elif setting.is_numeric:
+            setting.set_value(f"<{value.strip().strip('<>')}>")
+        else:
+            raise ValueError("Параметр доступен только для чтения")
+        self._drafts.discard(setting_id)
+        return setting
+
+    def set_draft(self, setting_id: int, dirty: bool) -> bool:
+        setting = self.get_setting(setting_id)
+        if not setting.is_numeric or type(dirty) is not bool:
+            raise ValueError("Invalid numeric draft")
+        if dirty:
+            self._drafts.add(setting_id)
+        else:
+            self._drafts.discard(setting_id)
+        return self.is_dirty
+
+    def reset_setting(self, setting_id: int, mode: str) -> BiosSetting:
+        setting = self.get_setting(setting_id)
+        if mode == "default":
+            setting.reset_to_default()
+        elif mode == "initial":
+            setting.reset_to_initial()
+        else:
+            raise ValueError("Unknown reset mode")
+        self._drafts.discard(setting_id)
+        return setting
+
+    def generate_changes(self) -> str:
+        if not any(s.is_modified for s in self.document.settings):
+            raise ValueError("Нет изменённых параметров для сохранения")
+        content = self.parser.generate_changes(self.document)
+        BiosService.validate_nvram_content(content)
+        return content
+
+    def generate_content(self) -> str:
+        content = self.parser.generate_content(self.document)
+        BiosService.validate_nvram_content(content)
+        return content
+
+    def mark_saved(self) -> None:
+        self._drafts.clear()
+        self._saved_values = self._compute_values()
+
+    def save_changes(self, target_path: str, write_fn: Callable[[str, str], None]) -> str:
+        content = self.generate_changes()
+        write_fn(target_path, content)
+        self.mark_saved()
+        return target_path
+
+    def save_as(
+        self,
+        target_path: str,
+        write_fn: Callable[[str, str], None],
+        protected_paths: tuple[str, ...] = (),
+    ) -> str:
+        resolved_target = str(Path(target_path).resolve())
+        for protected in protected_paths:
+            if Path(protected).resolve() == Path(resolved_target):
+                raise ValueError("Нельзя перезаписывать базовый файл экспорта NVRAM")
+        content = self.generate_content()
+        write_fn(resolved_target, content)
+        new_session = self.open_file(resolved_target, parser=self.parser)
+        self.filepath = new_session.filepath
+        self.document = new_session.document
+        self.document_id = new_session.document_id
+        self._saved_values = new_session._saved_values
+        self._drafts.clear()
+        return resolved_target
+
+
+class BiosExecutor:
+    """Coordinates SCEWIN command generation, dependency validation, safety backups, and execution."""
+
+    def __init__(
+        self,
+        service: BiosService,
+        runner: ProcessRunner | None = None,
+        vault: BackupVault | None = None,
+    ) -> None:
+        self.service = service
+        self.runner = runner or default_process_runner
+        self.vault = vault or BackupVault(service.config.backup_directory, resolve_fn=service.resolve_path)
+
+    def execute_export(self, description: str = "Экспорт BIOS") -> BiosOperationResult:
+        self.service._ensure_dependencies_ok()
+        exe = self.service.resolve_path(self.service.scewin_path)
+        out_file = self.service.resolve_path(self.service.config.nvram_file)
+        cmd = [exe, "/o", "/s", out_file]
+
+        logger.info("Executing BIOS export: %s", cmd)
+        cmd_result = self.runner(cmd, self.service.config.subprocess_timeout_seconds)
+        if not cmd_result.success:
+            raise BiosExecutionError(cmd_result.detail or f"SCEWIN exited with code {cmd_result.return_code}")
+
+        # Invariant: Auto-backup on successful export
+        backup_path = self.vault.create_backup(out_file)
+        return BiosOperationResult(
+            success=True,
+            description=description,
+            action="export",
+            stdout=cmd_result.stdout,
+            stderr=cmd_result.stderr,
+            return_code=cmd_result.return_code,
+            backup_path=backup_path,
+        )
+
+    def execute_import(
+        self,
+        nvram_path: str,
+        description: str = "Импорт BIOS",
+        action: str = "import",
+    ) -> BiosOperationResult:
+        self.service._ensure_dependencies_ok()
+        resolved_file = self.service.validate_nvram_file(nvram_path)
+
+        # Invariant: Mandatory safety backup before writing to BIOS
+        safety_backup_path = self.service.create_safety_backup()
+
+        exe = self.service.resolve_path(self.service.scewin_path)
+        cmd = [exe, "/i", "/s", resolved_file]
+
+        logger.info("Executing BIOS import (%s): %s", action, cmd)
+        cmd_result = self.runner(cmd, self.service.config.subprocess_timeout_seconds)
+        if not cmd_result.success:
+            raise BiosExecutionError(cmd_result.detail or f"SCEWIN exited with code {cmd_result.return_code}")
+
+        return BiosOperationResult(
+            success=True,
+            description=description,
+            action=action,
+            stdout=cmd_result.stdout,
+            stderr=cmd_result.stderr,
+            return_code=cmd_result.return_code,
+            backup_path=safety_backup_path,
+        )
