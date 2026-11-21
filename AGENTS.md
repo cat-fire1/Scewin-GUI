@@ -3,10 +3,7 @@
 ## Project Structure & Module Organization
 
 - `main.py` is the application entrypoint.
-- `frontend/src/` contains the React + TypeScript interface and CSS theme.
-- `scewin_gui/desktop.py` hosts the interface with pywebview / WebView2.
-- `scewin_gui/desktop_api.py` connects the interface to the Python services.
-- `scewin_gui/core.py` contains BIOS parsing, validation, and file operations.
+- `scewin_gui/` contains the modular GUI, services, workers, and localization code.
 - `SCEWIN_64.exe`, `amifldrv64.sys`, `amigendrv64.sys` are bundled vendor tools/drivers.
 - `icon.ico` contains the app icon asset.
 - `nvram.txt` and `nvram_new.txt` are sample/exported BIOS data files.
@@ -15,17 +12,12 @@
 
 ## Build, Test, and Development Commands
 
-- Install Python deps: `python -m pip install -r requirements.txt`.
-- Install frontend deps: `npm ci --prefix frontend`.
-- Build frontend: `npm run build --prefix frontend`.
-- Run locally: `python main.py`.
-- Develop UI: `npm run dev --prefix frontend`, then `python main.py --dev`.
-- Build Windows app: `.\build.ps1`; use a fresh `-DistPath` when old output contains local data.
-- Package a clean ZIP: `.\package-release.ps1 -BundlePath <bundle-directory>`.
+- Run locally: `python main.py` (starts the PyQt6 GUI).
+- Install deps: `pip install PyQt6 PyQt6-Fluent-Widgets` (required GUI libraries).
+- Optional: `pip install pywin32` (recommended for single-instance handling).
 
-Windows builds use PyInstaller --onefile: Python dependencies and UI assets are
-embedded in ScewinGUI.exe. Only the SCEWIN executable and two drivers are external.
-The packaged app requires WebView2 Runtime. Never package an _internal directory.
+This repo does not include a formal build system; development is done by running the
+Python entrypoint directly on Windows.
 
 ## Coding Style & Naming Conventions
 
@@ -36,15 +28,14 @@ The packaged app requires WebView2 Runtime. Never package an _internal directory
 
 ## Testing Guidelines
 
-- API tests: `python -m unittest discover -s tests -v`.
-- Native WebView2 smoke: `python tests/smoke_desktop.py` (synthetic files only).
-- Never run real BIOS operations as part of testing or publishing.
+- No automated test suite is currently present.
 - Do a manual smoke test after changes: launch the GUI, load a sample `nvram.txt`,
   edit a field, and save to a new file.
 
 ## Commit & Pull Request Guidelines
 
-- Use clear, imperative commit messages (e.g., "Fix BIOS export path").
+- No Git history is available in this repository, so no commit conventions are
+  established yet. Use clear, imperative messages (e.g., "Fix BIOS export path").
 - PRs should describe the change, include steps to test, and attach screenshots
   for UI changes.
 
