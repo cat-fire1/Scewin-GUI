@@ -123,7 +123,7 @@ CommandResult = BiosOperationResult
 
 
 class ProcessRunner(Protocol):
-    """Seam for executing vendor commands without coupling to subprocess."""
+    """Callable runner protocol for executing system commands."""
 
     def __call__(
         self,
@@ -722,7 +722,7 @@ class BackupItem:
 
 
 class BackupVault:
-    """Secure repository managing timestamped NVRAM backup archives."""
+    """Manages timestamped NVRAM backup archives and restoration."""
 
     def __init__(self, backup_dir: Path | str, resolve_fn: Callable[[str], str] | None = None) -> None:
         self.resolve_fn = resolve_fn or (lambda p: str(Path(p).resolve()))
@@ -782,7 +782,7 @@ class BackupVault:
 
 
 class BiosDocumentSession:
-    """Aggregate managing an active NVRAM document, mutations, drafts, and persistence."""
+    """Manages an active NVRAM document, setting changes, drafts, and persistence."""
 
     def __init__(
         self,

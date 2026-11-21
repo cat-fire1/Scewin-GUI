@@ -35,7 +35,7 @@ LANGUAGES = {"ru", "en", "uk"}
 
 
 class DesktopApi:
-    """Serialize requests, delegate to deep domain modules, and bridge to webview."""
+    """Serialize requests and bridge desktop operations to webview."""
 
     def __init__(
         self,
