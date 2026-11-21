@@ -173,7 +173,7 @@ def main() -> int:
                     destination.parent.mkdir(exist_ok=True)
                     ImageGrab.grab(bbox=(rect.left, rect.top, rect.right, rect.bottom)).save(destination)
                     print(f"Screenshot: {destination}")
-                except ImportError:
+                except (ImportError, OSError):
                     pass
                 print("Desktop smoke passed: real WebView2, 2400 rows, load/edit/apply/save/reload, duplicate option IDs, virtualization, search, register filter, locales, backup/about/docs")
             except Exception:

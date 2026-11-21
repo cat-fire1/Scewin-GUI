@@ -10,11 +10,24 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
 import webbrowser
 
 from .config import APP_CONFIG, AppConfig
-from .core import BiosParser, BiosService, BiosSetting, NvramDocument
+from .core import (
+    BackupVault,
+    BiosDocumentSession,
+    BiosExecutionError,
+    BiosExecutor,
+    BiosOperationResult,
+    BiosParser,
+    BiosPermissionError,
+    BiosService,
+    BiosSetting,
+    BiosTimeoutError,
+    NvramDocument,
+    ProcessRunner,
+    default_process_runner,
+)
 from .logging_config import get_logger
 
 logger = get_logger("desktop")
@@ -22,19 +35,55 @@ LANGUAGES = {"ru", "en", "uk"}
 
 
 class DesktopApi:
-    """Serialize requests, keep document ownership in Python, and guard BIOS writes."""
+    """Serialize requests, delegate to deep domain modules, and bridge to webview."""
 
-    def __init__(self, config: AppConfig = APP_CONFIG, base_dir: str | Path | None = None):
+    def __init__(
+        self,
+        config: AppConfig = APP_CONFIG,
+        base_dir: str | Path | None = None,
+        runner: ProcessRunner | None = None,
+    ):
         self._config = config
         self._service = BiosService(config=config, base_dir=base_dir)
+        self._vault = BackupVault(config.backup_directory, resolve_fn=self._service.resolve_path)
+
+        # Delegate execution through the runner port, supporting monkey-patched subprocess.run for tests
+        actual_runner = runner
+        if actual_runner is None:
+            def compat_runner(cmd: list[str], timeout: int) -> BiosOperationResult:
+                sub = getattr(sys.modules.get("scewin_gui.desktop_api"), "subprocess", subprocess)
+                creationflags = sub.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                try:
+                    proc = sub.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        errors="replace",
+                        check=False,
+                        timeout=timeout,
+                        creationflags=creationflags,
+                    )
+                    return BiosOperationResult(
+                        success=proc.returncode == 0,
+                        description=" ".join(cmd),
+                        action="",
+                        stdout=proc.stdout or "",
+                        stderr=proc.stderr or "",
+                        return_code=proc.returncode,
+                        error_kind="" if proc.returncode == 0 else (proc.stderr.strip() or proc.stdout.strip() or f"Process error {proc.returncode}"),
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise BiosTimeoutError("Таймаут операции SCEWIN") from exc
+                except PermissionError as exc:
+                    raise BiosPermissionError("Требуются права администратора для доступа к BIOS") from exc
+
+            actual_runner = compat_runner
+
+        self._executor = BiosExecutor(self._service, runner=actual_runner, vault=self._vault)
+        self._session: BiosDocumentSession | None = None
         self._parser = BiosParser()
         self._window = None
         self._lock = threading.Lock()
-        self._document: NvramDocument | None = None
-        self._document_id = ""
-        self._filepath = ""
-        self._saved_values: tuple = ()
-        self._drafts: set[int] = set()
         self._logs: list[str] = []
         self._language = self._read_language()
         self._catalogs = {}
@@ -44,6 +93,25 @@ class DesktopApi:
             extras = config.translation_dir / f"desktop_{language}.json"
             self._catalogs[language].update(json.loads(extras.read_text(encoding="utf-8")))
         self._initialized = False
+
+    @property
+    def _document(self) -> NvramDocument | None:
+        """Backwards compatibility property exposing active document."""
+        return self._session.document if self._session else None
+
+    @property
+    def _document_id(self) -> str:
+        """Backwards compatibility property exposing active document session ID."""
+        return self._session.document_id if self._session else ""
+
+    @property
+    def _filepath(self) -> str:
+        """Backwards compatibility property exposing active file path."""
+        return self._session.filepath if self._session else ""
+
+    def _dirty(self) -> bool:
+        """Backwards compatibility dirty calculation delegated to session."""
+        return self._session.is_dirty if self._session else False
 
     def request(self, action: str, payload: dict | None = None) -> dict:
         """The only JS entry point: a closed action list and structured failures."""
@@ -87,14 +155,6 @@ class DesktopApi:
         self._logs.append(f"[{time.strftime('%H:%M:%S')}] {message}")
         self._logs = self._logs[-200:]
 
-    def _values(self) -> tuple:
-        if self._document is None:
-            return ()
-        return tuple((s.current_value, s.current_option_id) for s in self._document.settings)
-
-    def _dirty(self) -> bool:
-        return bool(self._drafts) or self._values() != self._saved_values
-
     def _setting_data(self, index: int, setting: BiosSetting) -> dict:
         return {
             "id": index, "name": setting.name, "help": setting.help_string,
@@ -108,18 +168,21 @@ class DesktopApi:
         }
 
     def _snapshot(self, *, settings: bool = False, backups: bool = False) -> dict:
-        items = self._document.settings if self._document else []
+        items = self._session.document.settings if self._session else []
         result = {
-            "document_id": self._document_id, "filepath": self._filepath,
-            "dirty": self._dirty(), "modified_count": sum(s.is_modified for s in items),
-            "logs": self._logs[:], "language": self._language,
+            "document_id": self._document_id,
+            "filepath": self._filepath,
+            "dirty": self._dirty(),
+            "modified_count": self._session.modified_count if self._session else 0,
+            "logs": self._logs[:],
+            "language": self._language,
         }
         if settings:
             result["settings"] = [self._setting_data(i, s) for i, s in enumerate(items)]
         if backups:
             result["backups"] = [
-                {"path": path, "name": Path(path).name, "mtime": mtime, "size": size}
-                for path, mtime, size in self._service.list_backups()
+                {"path": b.path, "name": b.name, "mtime": b.mtime, "size": b.size}
+                for b in self._vault.list_all()
             ]
         return result
 
@@ -132,7 +195,8 @@ class DesktopApi:
             else:
                 self._log(self._t("deps.missing", files=", ".join(
                     status.missing + status.unreadable + status.tampered)))
-            if Path(self._service.resolve_path(self._config.nvram_file)).is_file():
+            resolved_nvram = self._service.resolve_path(self._config.nvram_file)
+            if Path(resolved_nvram).is_file():
                 try:
                     self._load(self._config.nvram_file)
                 except (OSError, ValueError) as error:
@@ -144,14 +208,13 @@ class DesktopApi:
         }
 
     def _load(self, filepath: str) -> None:
-        path = self._service.validate_nvram_file(filepath)
-        document = self._service.validate_nvram_content(self._service.load_file(path))
-        self._document = document
-        self._filepath = path
-        self._document_id = uuid.uuid4().hex
-        self._drafts.clear()
-        self._saved_values = self._values()
-        self._log(self._t("log.loaded", count=len(document.settings)))
+        resolved = self._service.resolve_path(filepath)
+        self._session = BiosDocumentSession.open_file(
+            resolved,
+            parser=self._parser,
+            load_fn=self._service.load_file,
+        )
+        self._log(self._t("log.loaded", count=len(self._session.document.settings)))
 
     def _confirm(self, title: str, message: str) -> bool:
         if self._window is None:
@@ -175,67 +238,52 @@ class DesktopApi:
         return {"cancelled": True}
 
     def _get_setting(self, payload: dict) -> tuple[int, BiosSetting]:
-        if self._document is None or payload.get("document_id") != self._document_id:
+        if self._session is None or payload.get("document_id") != self._document_id:
             raise ValueError(self._t("desktop.stale_document"))
         index = payload.get("id")
-        if type(index) is not int or not 0 <= index < len(self._document.settings):
+        if type(index) is not int or not 0 <= index < len(self._session.document.settings):
             raise ValueError("Invalid setting ID")
-        return index, self._document.settings[index]
+        return index, self._session.get_setting(index)
 
     def _edit(self, payload: dict) -> dict:
-        index, setting = self._get_setting(payload)
+        index, _ = self._get_setting(payload)
         value = payload.get("value")
-        if not isinstance(value, str):
-            raise ValueError("Invalid setting value")
-        if setting.options:
-            setting.set_option(value)
-        elif setting.is_numeric:
-            setting.set_value(f"<{value.strip().strip('<>')}>")
-        else:
-            raise ValueError(self._t("desktop.readonly"))
-        self._drafts.discard(index)
+        try:
+            setting = self._session.edit(index, value)
+        except ValueError as err:
+            if "Параметр доступен только для чтения" in str(err):
+                raise ValueError(self._t("desktop.readonly")) from err
+            raise
         self._log(self._t("log.changed", name=setting.name, value=setting.current_value))
         return {**self._snapshot(), "setting": self._setting_data(index, setting)}
 
     def _draft(self, payload: dict) -> dict:
-        index, setting = self._get_setting(payload)
+        index, _ = self._get_setting(payload)
         dirty = payload.get("dirty")
-        if not setting.is_numeric or type(dirty) is not bool:
-            raise ValueError("Invalid numeric draft")
-        if dirty:
-            self._drafts.add(index)
-        else:
-            self._drafts.discard(index)
-        return {"dirty": self._dirty()}
+        is_dirty = self._session.set_draft(index, dirty)
+        return {"dirty": is_dirty}
 
     def _reset(self, payload: dict) -> dict:
-        index, setting = self._get_setting(payload)
-        if payload.get("mode") == "default":
-            setting.reset_to_default()
+        index, _ = self._get_setting(payload)
+        mode = payload.get("mode")
+        setting = self._session.reset_setting(index, mode)
+        if mode == "default":
             self._log(self._t("log.reset", name=setting.name))
-        elif payload.get("mode") == "initial":
-            setting.reset_to_initial()
-        else:
-            raise ValueError("Unknown reset mode")
-        self._drafts.discard(index)
         return {**self._snapshot(), "setting": self._setting_data(index, setting)}
 
     def _save_changes(self, _payload: dict) -> dict:
-        if self._document is None or not any(s.is_modified for s in self._document.settings):
+        if self._session is None or self._session.modified_count == 0:
             raise ValueError(self._t("infobar.no_changes_content"))
-        content = self._parser.generate_changes(self._document)
-        self._service.validate_nvram_content(content)
         path = self._service.resolve_path(self._config.nvram_new_file)
-        self._service.atomic_write(path, content)
-        self._saved_values = self._values()
-        count = sum(s.is_modified for s in self._document.settings)
+        self._session.save_changes(path, write_fn=self._service.atomic_write)
+        count = self._session.modified_count
         self._log(self._t("apply.saved", count=count, file=path))
         return {**self._snapshot(), "message": self._t("infobar.ready_import_content", file=path)}
 
     def _save_as(self, _payload: dict) -> dict:
         import webview
 
-        if self._document is None:
+        if self._session is None:
             raise ValueError(self._t("infobar.no_loaded_file"))
         paths = self._window.create_file_dialog(
             webview.FileDialog.SAVE, save_filename="nvram_edited.txt",
@@ -244,13 +292,17 @@ class DesktopApi:
         if not paths:
             return {"cancelled": True}
         target = Path(paths[0]).resolve()
-        # Preserve the live export used for mandatory pre-import backups.
-        if target == Path(self._service.resolve_path(self._config.nvram_file)).resolve():
-            raise ValueError(self._t("desktop.protected_export"))
-        content = self._parser.generate_content(self._document)
-        self._service.validate_nvram_content(content)
-        self._service.atomic_write(str(target), content)
-        self._load(str(target))
+        live_export = Path(self._service.resolve_path(self._config.nvram_file)).resolve()
+        try:
+            self._session.save_as(
+                str(target),
+                write_fn=self._service.atomic_write,
+                protected_paths=(str(live_export),),
+            )
+        except ValueError as err:
+            if "базовый файл" in str(err):
+                raise ValueError(self._t("desktop.protected_export")) from err
+            raise
         self._log(self._t("desktop.saved", path=str(target)))
         return {**self._snapshot(settings=True), "message": self._t("desktop.saved", path=str(target))}
 
@@ -259,7 +311,7 @@ class DesktopApi:
 
     def _create_backup(self, _payload: dict) -> dict:
         self._service.validate_nvram_file(self._config.nvram_file)
-        path = self._service.create_backup(self._config.nvram_file, self._config.backup_directory)
+        path = self._vault.create_backup(self._config.nvram_file)
         self._log(self._t("backup.created", path=path))
         return {**self._snapshot(backups=True), "message": self._t("backup.saved", path=path)}
 
@@ -267,25 +319,22 @@ class DesktopApi:
         path = payload.get("path")
         if not isinstance(path, str):
             raise ValueError("Invalid backup path")
-        target = Path(path).resolve()
-        directory = Path(self._service.resolve_path(self._config.backup_directory)).resolve()
-        if target.parent != directory or not target.is_file():
-            raise ValueError(self._t("backup.file_missing"))
-        return str(target)
+        try:
+            return str(self._vault.validate_backup_path(path))
+        except ValueError as err:
+            raise ValueError(self._t("backup.file_missing")) from err
 
     def _delete_backup(self, payload: dict) -> dict:
         path = self._backup_path(payload)
         if not self._confirm(self._t("backup.delete_title"),
                              self._t("backup.delete_text", name=Path(path).name)):
             return {"cancelled": True}
-        self._service.delete_backup(path)
+        self._vault.delete(path)
         self._log(self._t("backup.deleted", path=path))
         return self._snapshot(backups=True)
 
     def _open_backup_folder(self, _payload: dict) -> dict:
-        path = self._service.resolve_path(self._config.backup_directory)
-        os.makedirs(path, exist_ok=True)
-        os.startfile(path)
+        self._vault.open_in_explorer()
         return {}
 
     def _bios(self, payload: dict) -> dict:
@@ -293,7 +342,24 @@ class DesktopApi:
         if action == "export":
             if not self._confirm_discard():
                 return {"cancelled": True}
-            operation = self._service.create_export_operation(self._t("action.export"))
+            self._log(self._t("log.started", desc=self._t("action.export")))
+            try:
+                result = self._executor.execute_export(description=self._t("action.export"))
+            except BiosTimeoutError as error:
+                raise RuntimeError(self._t("bios.timeout")) from error
+            except BiosPermissionError as error:
+                raise RuntimeError(self._t("bios.permission")) from error
+            except BiosExecutionError as error:
+                raise RuntimeError(str(error)) from error
+
+            if result.stdout.strip():
+                self._log(result.stdout.strip())
+            self._load(self._config.nvram_file)
+            self._log(self._t("backup.auto_created", path=result.backup_path))
+            self._log(self._t("infobar.success_content"))
+            return {**self._snapshot(settings=True, backups=True),
+                    "message": self._t("infobar.success_content")}
+
         elif action in {"import", "import_loaded", "restore"}:
             if action == "import_loaded":
                 if not self._filepath:
@@ -302,47 +368,34 @@ class DesktopApi:
             elif action == "restore":
                 path = self._backup_path(payload)
             else:
-                path = self._config.nvram_new_file
-            operation = self._service.create_import_operation(
-                path, self._t("action.import_loaded" if action == "import_loaded" else "action.import"),
-                action=action,
-            )
-        else:
-            raise ValueError("Unknown BIOS operation")
-        if operation.dangerous:
-            message = self._t("bios.confirm_text", action=operation.description)
-            message += "\n\n" + str(operation.arguments[-1])
+                path = self._service.resolve_path(self._config.nvram_new_file)
+
+            desc = self._t("action.import_loaded" if action == "import_loaded" else "action.import")
+            message = self._t("bios.confirm_text", action=desc) + "\n\n" + str(path)
             if action == "import_loaded" and self._dirty():
                 message += "\n\n" + self._t("desktop.import_disk")
             if not self._confirm(self._t("bios.confirm_title"), message):
                 return {"cancelled": True}
-        if operation.requires_backup:
-            backup = self._service.create_safety_backup()
-            self._log(self._t("bios.backup_created", path=backup))
-        self._log(self._t("log.started", desc=operation.description))
-        try:
-            result = subprocess.run(
-                [operation.executable, *operation.arguments], capture_output=True,
-                text=True, errors="replace", check=False,
-                timeout=self._config.subprocess_timeout_seconds,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise RuntimeError(self._t("bios.timeout")) from error
-        except PermissionError as error:
-            raise RuntimeError(self._t("bios.permission")) from error
-        if result.stdout.strip():
-            self._log(result.stdout.strip())
-        if result.returncode:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip()
-                               or f"SCEWIN: {result.returncode}")
-        self._log(self._t("infobar.success_content"))
-        if action == "export":
-            self._load(self._config.nvram_file)
-            backup = self._service.create_backup(self._config.nvram_file, self._config.backup_directory)
-            self._log(self._t("backup.auto_created", path=backup))
-        return {**self._snapshot(settings=action == "export", backups=True),
-                "message": self._t("infobar.success_content")}
+
+            self._log(self._t("log.started", desc=desc))
+            try:
+                result = self._executor.execute_import(path, description=desc, action=action)
+            except BiosTimeoutError as error:
+                raise RuntimeError(self._t("bios.timeout")) from error
+            except BiosPermissionError as error:
+                raise RuntimeError(self._t("bios.permission")) from error
+            except BiosExecutionError as error:
+                raise RuntimeError(str(error)) from error
+
+            if result.backup_path:
+                self._log(self._t("bios.backup_created", path=result.backup_path))
+            if result.stdout.strip():
+                self._log(result.stdout.strip())
+            self._log(self._t("infobar.success_content"))
+            return {**self._snapshot(settings=False, backups=True),
+                    "message": self._t("infobar.success_content")}
+
+        raise ValueError("Unknown BIOS operation")
 
     def _read_language(self) -> str:
         settings = configparser.ConfigParser(interpolation=None)
