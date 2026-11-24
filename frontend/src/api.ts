@@ -87,7 +87,7 @@ function handleMockRequest(action: Action, payload: Payload): Update {
         settings: mockSettings,
         backups: mockBackups,
         app_name: 'Scewin GUI (Mock)',
-        version: '2.0.0',
+        version: '2.0.1',
         dependencies: { ok: true, missing: [], unreadable: [], tampered: [], hvci_active: false },
       };
     case 'open_file':
