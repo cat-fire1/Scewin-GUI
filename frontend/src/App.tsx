@@ -3,6 +3,7 @@ import { AlertTriangle, CheckCircle2, LoaderCircle, X } from 'lucide-react';
 import { createBiosGateway, DesktopError, isActionBlocking, request } from './api';
 import { Sidebar } from './components/Sidebar';
 import { BiosProvider } from './context/BiosContext';
+import { BiosStoreProvider } from './context/BiosStore';
 import { translator } from './i18n';
 import { About } from './pages/About';
 import { Backups } from './pages/Backups';
@@ -84,7 +85,8 @@ export function App() {
 
   return (
     <BiosProvider gateway={gateway}>
-      <div className="app-shell">
+      <BiosStoreProvider state={state}>
+        <div className="app-shell">
         <Sidebar
           page={page}
           onPage={next => {
@@ -141,6 +143,7 @@ export function App() {
           )}
         </main>
       </div>
+      </BiosStoreProvider>
     </BiosProvider>
   );
 }

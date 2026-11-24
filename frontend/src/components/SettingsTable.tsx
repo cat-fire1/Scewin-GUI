@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, RotateCcw, Undo2 } from 'lucide-react';
 import { useBiosGateway } from '../context/BiosContext';
 import type { Setting, Translate } from '../types';
@@ -66,7 +66,7 @@ function NumericEditor({ setting, disabled, save, onDraft, t }: {
   );
 }
 
-export function SettingsTable({ settings, query, hideRegisters, selected, onSelect, busy, t }: Props) {
+export const SettingsTable = memo(function SettingsTable({ settings, query, hideRegisters, selected, onSelect, busy, t }: Props) {
   const gateway = useBiosGateway();
   const [sort, setSort] = useState<{ key: SortKey; direction: number } | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -263,4 +263,4 @@ export function SettingsTable({ settings, query, hideRegisters, selected, onSele
       </div>
     </section>
   );
-}
+});
