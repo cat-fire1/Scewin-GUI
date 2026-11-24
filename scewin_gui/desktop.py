@@ -90,7 +90,7 @@ def main(arguments: list[str] | None = None) -> int:
         _message("Установите зависимости: python -m pip install -r requirements.txt")
         return 1
 
-    from .desktop_api import DesktopApi
+    from .desktop_api import DesktopApi, WebviewDialogHost
 
     configure_logging(APP_CONFIG.app_dir / "logs")
     if sys.platform == "win32":
@@ -101,12 +101,14 @@ def main(arguments: list[str] | None = None) -> int:
         if not guard.acquire():
             _message("Scewin GUI уже запущен.")
             return 0
-        api = DesktopApi()
+        dialog_host = WebviewDialogHost()
+        api = DesktopApi(dialog_host=dialog_host)
         window = webview.create_window(
             APP_CONFIG.app_name, url, js_api=api,
             width=APP_CONFIG.window_width, height=APP_CONFIG.window_height,
             min_size=(960, 640), background_color="#202020", text_select=True,
         )
+        dialog_host.window = window
         api._window = window
         window.events.shown += lambda: _style_window(window)
         window.events.closing += api._on_closing

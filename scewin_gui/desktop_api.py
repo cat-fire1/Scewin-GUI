@@ -12,12 +12,15 @@ import threading
 import time
 import webbrowser
 
+from typing import Any, Protocol
+
 from .config import APP_CONFIG, AppConfig
 from .core import (
     BackupVault,
     BiosDocumentSession,
     BiosExecutionError,
     BiosExecutor,
+    BiosHardware,
     BiosOperationResult,
     BiosParser,
     BiosPermissionError,
@@ -34,6 +37,74 @@ logger = get_logger("desktop")
 LANGUAGES = {"ru", "en", "uk"}
 
 
+class DialogHost(Protocol):
+    """Seam for desktop modal dialog interactions."""
+
+    def choose_open_file(self, file_types: tuple[str, ...]) -> str | None: ...
+    def choose_save_file(self, default_filename: str, file_types: tuple[str, ...]) -> str | None: ...
+    def confirm(self, title: str, message: str) -> bool: ...
+
+
+class WebviewDialogHost:
+    """Production dialog host using a PyWebView window."""
+
+    def __init__(self, window: Any = None) -> None:
+        self.window = window
+
+    def choose_open_file(self, file_types: tuple[str, ...]) -> str | None:
+        if self.window is None:
+            raise RuntimeError("Desktop window is not ready")
+        import webview
+
+        paths = self.window.create_file_dialog(
+            webview.FileDialog.OPEN,
+            file_types=file_types,
+        )
+        return paths[0] if paths else None
+
+    def choose_save_file(self, default_filename: str, file_types: tuple[str, ...]) -> str | None:
+        if self.window is None:
+            raise RuntimeError("Desktop window is not ready")
+        import webview
+
+        paths = self.window.create_file_dialog(
+            webview.FileDialog.SAVE,
+            save_filename=default_filename,
+            file_types=file_types,
+        )
+        return paths[0] if paths else None
+
+    def confirm(self, title: str, message: str) -> bool:
+        if self.window is None:
+            raise RuntimeError("Desktop window is not ready")
+        return bool(self.window.create_confirmation_dialog(title, message))
+
+
+class FakeDialogHost:
+    """Test and headless dialog host with configurable responses."""
+
+    def __init__(
+        self,
+        open_result: str | None = None,
+        save_result: str | None = None,
+        confirm_result: bool = True,
+    ) -> None:
+        self.open_result = open_result
+        self.save_result = save_result
+        self.confirm_result = confirm_result
+        self.confirmations: list[tuple[str, str]] = []
+
+    def choose_open_file(self, file_types: tuple[str, ...]) -> str | None:
+        return self.open_result
+
+    def choose_save_file(self, default_filename: str, file_types: tuple[str, ...]) -> str | None:
+        return self.save_result
+
+    def confirm(self, title: str, message: str) -> bool:
+        self.confirmations.append((title, message))
+        return self.confirm_result
+
+
 class DesktopApi:
     """Serialize requests and bridge desktop operations to webview."""
 
@@ -42,10 +113,14 @@ class DesktopApi:
         config: AppConfig = APP_CONFIG,
         base_dir: str | Path | None = None,
         runner: ProcessRunner | None = None,
+        dialog_host: DialogHost | None = None,
+        hardware: BiosHardware | None = None,
+        vault: BackupVault | None = None,
     ):
         self._config = config
         self._service = BiosService(config=config, base_dir=base_dir)
-        self._vault = BackupVault(config.backup_directory, resolve_fn=self._service.resolve_path)
+        self._vault = vault or BackupVault(config.backup_directory, resolve_fn=self._service.resolve_path)
+        self._dialogs = dialog_host or WebviewDialogHost()
 
         # Delegate execution through the runner port, supporting monkey-patched subprocess.run for tests
         actual_runner = runner
@@ -79,10 +154,16 @@ class DesktopApi:
 
             actual_runner = compat_runner
 
-        self._executor = BiosExecutor(self._service, runner=actual_runner, vault=self._vault)
+        self._hardware = hardware or BiosHardware(
+            config=config,
+            vault=self._vault,
+            runner=actual_runner,
+            base_dir=base_dir,
+        )
+        self._executor = self._hardware
         self._session: BiosDocumentSession | None = None
         self._parser = BiosParser()
-        self._window = None
+        self._window_ref = None
         self._lock = threading.Lock()
         self._logs: list[str] = []
         self._language = self._read_language()
@@ -216,24 +297,32 @@ class DesktopApi:
         )
         self._log(self._t("log.loaded", count=len(self._session.document.settings)))
 
+    @property
+    def _window(self):
+        """Backwards compatibility property exposing window from dialog host."""
+        if isinstance(self._dialogs, WebviewDialogHost):
+            return self._dialogs.window
+        return self._window_ref
+
+    @_window.setter
+    def _window(self, win):
+        self._window_ref = win
+        if isinstance(self._dialogs, WebviewDialogHost):
+            self._dialogs.window = win
+
     def _confirm(self, title: str, message: str) -> bool:
-        if self._window is None:
-            raise RuntimeError("Desktop window is not ready")
-        return bool(self._window.create_confirmation_dialog(title, message))
+        return self._dialogs.confirm(title, message)
 
     def _confirm_discard(self) -> bool:
         return not self._dirty() or self._confirm(
             self._t("desktop.unsaved_title"), self._t("desktop.unsaved_text"))
 
     def _open_file(self, _payload: dict) -> dict:
-        import webview
-
-        paths = self._window.create_file_dialog(
-            webview.FileDialog.OPEN,
-            file_types=("NVRAM (*.txt;*.nvram)", "All files (*.*)"),
+        path = self._dialogs.choose_open_file(
+            ("NVRAM (*.txt;*.nvram)", "All files (*.*)"),
         )
-        if paths and self._confirm_discard():
-            self._load(paths[0])
+        if path and self._confirm_discard():
+            self._load(path)
             return self._snapshot(settings=True)
         return {"cancelled": True}
 
@@ -281,17 +370,15 @@ class DesktopApi:
         return {**self._snapshot(), "message": self._t("infobar.ready_import_content", file=path)}
 
     def _save_as(self, _payload: dict) -> dict:
-        import webview
-
         if self._session is None:
             raise ValueError(self._t("infobar.no_loaded_file"))
-        paths = self._window.create_file_dialog(
-            webview.FileDialog.SAVE, save_filename="nvram_edited.txt",
-            file_types=("NVRAM (*.txt)",),
+        path = self._dialogs.choose_save_file(
+            "nvram_edited.txt",
+            ("NVRAM (*.txt)",),
         )
-        if not paths:
+        if not path:
             return {"cancelled": True}
-        target = Path(paths[0]).resolve()
+        target = Path(path).resolve()
         live_export = Path(self._service.resolve_path(self._config.nvram_file)).resolve()
         try:
             self._session.save_as(
@@ -310,8 +397,9 @@ class DesktopApi:
         return self._snapshot(backups=True)
 
     def _create_backup(self, _payload: dict) -> dict:
-        self._service.validate_nvram_file(self._config.nvram_file)
-        path = self._vault.create_backup(self._config.nvram_file)
+        source = self._service.resolve_path(self._config.nvram_file)
+        self._service.validate_nvram_file(source)
+        path = self._vault.create_backup(source)
         self._log(self._t("backup.created", path=path))
         return {**self._snapshot(backups=True), "message": self._t("backup.saved", path=path)}
 
