@@ -38,6 +38,7 @@ export interface DesktopState {
   backups: Backup[];
   app_name: string;
   version: string;
+  is_admin?: boolean;
   dependencies?: {
     ok: boolean;
     missing: string[];

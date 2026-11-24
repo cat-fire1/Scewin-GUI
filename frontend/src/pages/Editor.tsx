@@ -11,7 +11,7 @@ export function Editor({ state, busy, t }: {
   const gateway = useBiosGateway();
   const [query, setQuery] = useState('');
   const deferredQuery = useDeferredValue(query);
-  const [hideRegisters, setHideRegisters] = useState(false);
+  const [hideRegisters, setHideRegisters] = useState(true);
   const [selected, setSelected] = useState<number | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 

@@ -52,7 +52,7 @@ VSVersionInfo(
 "@
     [System.IO.File]::WriteAllText($versionPath, $versionResource, (New-Object System.Text.UTF8Encoding($false)))
 
-    & python -m PyInstaller --noconfirm --windowed --onefile `
+    & python -m PyInstaller --noconfirm --windowed --onefile --uac-admin `
         --name ScewinGUI --icon icon.ico --distpath $bundlePath `
         --version-file $versionPath `
         --add-data 'frontend/dist;frontend/dist' `

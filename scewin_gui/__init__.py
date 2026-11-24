@@ -18,6 +18,7 @@ from .core import (
     NvramDocument,
     ProcessRunner,
     default_process_runner,
+    is_user_admin,
 )
 
 __all__ = [
@@ -39,4 +40,5 @@ __all__ = [
     "NvramDocument",
     "ProcessRunner",
     "default_process_runner",
+    "is_user_admin",
 ]

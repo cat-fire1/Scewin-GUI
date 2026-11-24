@@ -286,6 +286,7 @@ class DesktopApi:
             **self._snapshot(settings=True, backups=True),
             "app_name": self._config.app_name, "version": self._config.app_version,
             "dependencies": status._asdict(),
+            "is_admin": self._hardware.admin_check(),
         }
 
     def _load(self, filepath: str) -> None:

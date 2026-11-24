@@ -20,6 +20,7 @@ from .hardware import (
     calculate_sha256,
     default_process_runner,
     is_hvci_active,
+    is_user_admin,
 )
 from .nvram import (
     BiosDocumentSession,
@@ -57,6 +58,7 @@ __all__ = [
     "calculate_sha256",
     "default_process_runner",
     "is_hvci_active",
+    "is_user_admin",
     "load_text_file",
     "validate_nvram_content",
     "validate_settings",

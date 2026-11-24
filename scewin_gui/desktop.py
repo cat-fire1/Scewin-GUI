@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 
 from .config import APP_CONFIG
+from .hardware import is_user_admin
 from .logging_config import configure_logging
 
 
@@ -62,11 +63,35 @@ def _style_window(window) -> None:
         pass
 
 
+def _relaunch_as_admin(arguments: list[str] | None = None) -> bool:
+    """Re-launch the current application requesting UAC elevation on Windows."""
+    if sys.platform != "win32":
+        return True
+    import subprocess
+
+    if getattr(sys, "frozen", False):
+        executable = sys.executable
+        cli_args = arguments if arguments is not None else sys.argv[1:]
+    else:
+        executable = sys.executable
+        cli_args = [str(Path(sys.argv[0]).resolve())] + (
+            arguments if arguments is not None else sys.argv[1:]
+        )
+    params = subprocess.list2cmdline(cli_args)
+    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, params, None, 1)
+    return int(rc) > 32
+
+
 def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Scewin GUI desktop application")
     parser.add_argument("--debug", action="store_true", help="Enable WebView developer tools")
     parser.add_argument("--dev", action="store_true", help="Load the local Vite server with hot reload")
     args = parser.parse_args(arguments)
+    if sys.platform == "win32" and not is_user_admin():
+        if _relaunch_as_admin(arguments):
+            return 0
+        _message("Для работы с BIOS требуются права администратора.")
+        return 1
     root = Path(getattr(sys, "_MEIPASS", APP_CONFIG.app_dir))
     index = root / "frontend" / "dist" / "index.html"
     if not args.dev and not index.is_file():

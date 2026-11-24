@@ -64,6 +64,18 @@ def is_hvci_active() -> bool:
         return False
 
 
+def is_user_admin() -> bool:
+    """Return True if running with administrator privileges (or on non-Windows)."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
+
+
 class SafetyBackupError(RuntimeError):
     """Raised when a mandatory pre-import backup cannot be created."""
 
@@ -192,12 +204,14 @@ class BiosHardware:
         runner: ProcessRunner | None = None,
         base_dir: str | Path | None = None,
         scewin_path: str | None = None,
+        admin_check: Callable[[], bool] | None = None,
     ) -> None:
         self.config = config
         self.base_dir = str(Path(base_dir).resolve()) if base_dir else str(config.app_dir)
         self.scewin_path = scewin_path or config.scewin_executable
         self.vault = vault or BackupVault(config.backup_directory, resolve_fn=self.resolve_path)
         self.runner = runner or default_process_runner
+        self.admin_check = admin_check or is_user_admin
 
     def resolve_path(self, path: str) -> str:
         """Resolve relative paths against the application directory."""
@@ -257,6 +271,10 @@ class BiosHardware:
             hvci_active=hvci,
         )
 
+    def _ensure_admin(self) -> None:
+        if not self.admin_check():
+            raise BiosPermissionError("Требуются права администратора для доступа к BIOS")
+
     def _ensure_dependencies_ok(self) -> None:
         status = self.check_dependencies()
         if not status.ok:
@@ -279,6 +297,7 @@ class BiosHardware:
             raise SafetyBackupError(f"Не удалось создать обязательный бэкап: {error}") from error
 
     def execute_export(self, description: str = "Экспорт BIOS") -> BiosOperationResult:
+        self._ensure_admin()
         self._ensure_dependencies_ok()
         exe = self.resolve_path(self.scewin_path)
         out_file = self.resolve_path(self.config.nvram_file)
@@ -308,6 +327,7 @@ class BiosHardware:
         description: str = "Импорт BIOS",
         action: str = "import",
     ) -> BiosOperationResult:
+        self._ensure_admin()
         self._ensure_dependencies_ok()
         resolved_file = BiosService.validate_nvram_file_path(nvram_path, resolve_fn=self.resolve_path)
 
@@ -381,6 +401,10 @@ class BiosService:
 
     def get_required_files(self) -> list[str]:
         return [self.scewin_path, "amifldrv64.sys", "amigendrv64.sys"]
+
+    def _ensure_admin(self) -> None:
+        if not self.admin_check():
+            raise BiosPermissionError("Требуются права администратора для доступа к BIOS")
 
     def _ensure_dependencies_ok(self) -> None:
         status = self.check_dependencies()

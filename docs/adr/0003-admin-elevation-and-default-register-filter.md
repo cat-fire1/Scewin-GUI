@@ -1,0 +1,3 @@
+# Mandatory Administrator Elevation and Default Register Filter
+
+We enforce administrator privileges at two levels: embedding `--uac-admin` in the PyInstaller executable manifest (`build.ps1`) and checking `IsUserAnAdmin()` at startup (`desktop.py`) with automatic `ShellExecuteW(..., "runas")` re-launch, plus an injectable `admin_check` seam in `BiosHardware` before any SCEWIN execution. On the frontend, `hideRegisters` defaults to `true` on every launch (`Editor.tsx`) without persisting to `settings.ini` so users are always protected from accidental modification of low-level PHY/PMU registers while retaining one-click toggle access per session.
